@@ -11,8 +11,6 @@ pub fn build(b: *std.build.Builder) void {
     exe.setBuildMode(mode);
     exe.install();
 
-    exe.emit_docs = .{.emit_to = "gen"};
-
     const vk_gen_step = vk.VkGenerateStep.init(b, "dep/KhronosGroup/Vulkan-Docs/xml/vk.xml", "generated/vk.zig");
     exe.step.dependOn(&vk_gen_step.step);
     exe.addPackage(vk_gen_step.package);

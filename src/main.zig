@@ -60,87 +60,19 @@ const VkInstance = struct {
         loader: anytype,
         args: CreateArgs,
     ) !VkInstance {
+        const vk_allocator: vk.AllocationCallbacks = allocatorVulkanWrapper(&allocator);
+        const bd = try BaseDispatch.load(loader);
+
         var arena_state = std.heap.ArenaAllocator.init(allocator);
         defer arena_state.deinit();
-
         const arena = arena_state.allocator();
-
-        const bd = try BaseDispatch.load(loader);
 
         const instance_version = try bd.enumerateInstanceVersion();
         std.log.info("Instance Version: {}", .{fmtApiVersion(instance_version)});
 
-        const available_layers: []const vk.LayerProperties = available_layers: {
-            var count: u32 = undefined;
-            if (bd.enumerateInstanceLayerProperties(&count, null)) |result| switch (result) {
-                .success => {},
-                else => std.log.warn("`enumerateInstanceLayerProperties`: {s}\n", .{@tagName(result)}),
-            } else |err| return err;
-
-            const available_layers = try arena.alloc(vk.LayerProperties, count);
-            if (bd.enumerateInstanceLayerProperties(&count, available_layers.ptr)) |result| switch (result) {
-                .success => {},
-                else => std.log.warn("`enumerateInstanceLayerProperties`: {s}\n", .{@tagName(result)}),
-            } else |err| return err;
-
-            std.debug.assert(count == available_layers.len);
-            break :available_layers available_layers;
-        };
-        defer arena.free(available_layers);
-
-        const available_extensions: []const vk.ExtensionProperties = available_extensions: {
-            var count: u32 = undefined;
-            if (bd.enumerateInstanceExtensionProperties(null, &count, null)) |result| switch (result) {
-                .success => {},
-                else => std.log.warn("`enumerateInstanceExtensionProperties`: {s}\n", .{@tagName(result)}),
-            } else |err| return err;
-
-            const available_extensions = try arena.alloc(vk.ExtensionProperties, count);
-            if (bd.enumerateInstanceExtensionProperties(null, &count, available_extensions.ptr)) |result| switch (result) {
-                .success => {},
-                else => std.log.warn("`enumerateInstanceExtensionProperties`: {s}\n", .{@tagName(result)}),
-            } else |err| return err;
-
-            std.debug.assert(count == available_extensions.len);
-            break :available_extensions available_extensions;
-        };
-        defer arena.free(available_extensions);
-
-        {
-            var log_buffer = std.ArrayList(u8).init(arena);
-            defer log_buffer.deinit();
-
-            log_buffer.shrinkRetainingCapacity(0);
-            try log_buffer.writer().writeAll("Found Layers:\n");
-            for (available_layers) |*layer| {
-                try log_buffer.writer().print(
-                    \\(*) Name: {s}
-                    \\    Spec: {}
-                    \\    Impl: {}
-                    \\    Description: {s}
-                    \\
-                    \\
-                , .{
-                    std.mem.sliceTo(&layer.layer_name, 0),
-                    fmtApiVersion(layer.spec_version),
-                    fmtApiVersion(layer.implementation_version),
-                    std.mem.sliceTo(&layer.description, 0),
-                });
-            }
-            log_buffer.shrinkRetainingCapacity(log_buffer.items.len - 2);
-            std.log.debug("{s}\n", .{log_buffer.items});
-
-            log_buffer.shrinkRetainingCapacity(0);
-            try log_buffer.writer().writeAll("Found Extensions:\n");
-            for (available_extensions) |*extension| {
-                try log_buffer.writer().print(
-                    \\(*) {s}: {}
-                    \\
-                , .{ std.mem.sliceTo(&extension.extension_name, 0), fmtApiVersion(extension.spec_version) });
-            }
-            log_buffer.shrinkRetainingCapacity(log_buffer.items.len - 1);
-            std.log.debug("{s}\n", .{log_buffer.items});
-        }
+        const available_layers: []const vk.LayerProperties = try enumerateInstanceLayerPropertiesAlloc(arena, bd);
+        const available_extensions: []const vk.ExtensionProperties = try enumerateInstanceExtensionPropertiesAlloc(arena, bd, null);
+        try logLayersAndExtensions(arena, available_layers, available_extensions);
 
         const handle = try bd.createInstance(&vk.InstanceCreateInfo{
             .flags = vk.InstanceCreateFlags{},
@@ -151,7 +83,12 @@ const VkInstance = struct {
                 .p_engine_name = null,
                 .engine_version = 0,
 
-                .api_version = vk.API_VERSION_1_0,
+                .api_version = switch (vk.apiVersionMinor(instance_version)) {
+                    0 => vk.API_VERSION_1_0,
+                    1 => vk.API_VERSION_1_1,
+                    2 => vk.API_VERSION_1_2,
+                    else => vk.API_VERSION_1_3,
+                },
             },
 
             .enabled_layer_count = @intCast(u32, args.desired_layers.len),
@@ -159,20 +96,105 @@ const VkInstance = struct {
 
             .enabled_extension_count = @intCast(u32, args.desired_extensions.len),
             .pp_enabled_extension_names = args.desired_extensions.ptr,
-        }, &allocatorVulkanWrapper(&allocator));
+        }, &vk_allocator);
         const dsp = InstanceDispatch.load(handle, getInstanceProcAddress) catch |err| {
             if (InstanceDispatchMin.load(handle, getInstanceProcAddress)) |inst_dsp_min| {
-                inst_dsp_min.destroyInstance(handle, &allocatorVulkanWrapper(&allocator));
+                inst_dsp_min.destroyInstance(handle, &vk_allocator);
             } else |_| {
                 std.log.warn("Failed to load function to destroy vulkan instance before encountering error; cleanup not possible.", .{});
             }
             return err;
         };
-
         return VkInstance{
             .handle = handle,
             .dsp = dsp,
         };
+    }
+
+    fn logLayersAndExtensions(
+        allocator: std.mem.Allocator,
+        available_layers: []const vk.LayerProperties,
+        available_extensions: []const vk.ExtensionProperties,
+    ) !void {
+        var log_buffer = std.ArrayList(u8).init(allocator);
+        defer log_buffer.deinit();
+
+        log_buffer.shrinkRetainingCapacity(0);
+        try log_buffer.writer().writeAll("Found Layers:\n");
+        for (available_layers) |*layer| {
+            try log_buffer.writer().print(
+                \\(*) Name: {s}
+                \\    Spec: {}
+                \\    Impl: {}
+                \\    Description: {s}
+                \\
+                \\
+            , .{
+                std.mem.sliceTo(&layer.layer_name, 0),
+                fmtApiVersion(layer.spec_version),
+                fmtApiVersion(layer.implementation_version),
+                std.mem.sliceTo(&layer.description, 0),
+            });
+        }
+        log_buffer.shrinkRetainingCapacity(log_buffer.items.len - 2);
+        std.log.debug("{s}\n", .{log_buffer.items});
+
+        log_buffer.shrinkRetainingCapacity(0);
+        try log_buffer.writer().writeAll("Found Extensions:\n");
+        for (available_extensions) |*extension| {
+            try log_buffer.writer().print(
+                \\(*) {s}: {}
+                \\
+            , .{ std.mem.sliceTo(&extension.extension_name, 0), fmtApiVersion(extension.spec_version) });
+        }
+        log_buffer.shrinkRetainingCapacity(log_buffer.items.len - 1);
+
+        std.log.debug("{s}\n", .{log_buffer.items});
+    }
+    fn enumerateInstanceLayerPropertiesAlloc(
+        allocator: std.mem.Allocator,
+        bd: BaseDispatch,
+    ) ![]vk.LayerProperties {
+        var count: u32 = undefined;
+        if (bd.enumerateInstanceLayerProperties(&count, null)) |result| switch (result) {
+            .success => {},
+            else => std.log.warn("`{s}`: {s}\n", .{ @src().fn_name, @tagName(result) }),
+        } else |err| return err;
+
+        const layer_properties = try allocator.alloc(vk.LayerProperties, count);
+        errdefer allocator.free(layer_properties);
+
+        if (bd.enumerateInstanceLayerProperties(&count, layer_properties.ptr)) |result| switch (result) {
+            .success => {},
+            else => std.log.warn("`{s}`: {s}\n", .{ @src().fn_name, @tagName(result) }),
+        } else |err| return err;
+
+        std.debug.assert(layer_properties.len == count);
+        return layer_properties;
+    }
+    fn enumerateInstanceExtensionPropertiesAlloc(
+        allocator: std.mem.Allocator,
+        bd: BaseDispatch,
+        layer_name: ?[:0]const u8,
+    ) ![]vk.ExtensionProperties {
+        const p_layer_name: ?[*:0]const u8 = if (layer_name) |ln| ln.ptr else null;
+
+        var count: u32 = undefined;
+        if (bd.enumerateInstanceExtensionProperties(p_layer_name, &count, null)) |result| switch (result) {
+            .success => {},
+            else => std.log.warn("`{s}`: {s}\n", .{ @src().fn_name, @tagName(result) }),
+        } else |err| return err;
+
+        const extension_properties = try allocator.alloc(vk.ExtensionProperties, count);
+        errdefer allocator.free(extension_properties);
+
+        if (bd.enumerateInstanceExtensionProperties(p_layer_name, &count, extension_properties.ptr)) |result| switch (result) {
+            .success => {},
+            else => std.log.warn("`{s}`: {s}\n", .{ @src().fn_name, @tagName(result) }),
+        } else |err| return err;
+
+        std.debug.assert(extension_properties.len == count);
+        return extension_properties;
     }
 };
 
