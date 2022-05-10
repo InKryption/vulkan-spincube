@@ -298,25 +298,6 @@ const VkEngine = struct {
     }
 };
 
-const CStringSet = std.ArrayHashMapUnmanaged([*:0]const u8, void, struct {
-    pub fn hash(ctx: @This(), c_str: [*:0]const u8) u32 {
-        _ = ctx;
-        return std.array_hash_map.StringContext.hash(.{}, std.mem.span(c_str));
-    }
-    pub fn eql(ctx: @This(), a: [*:0]const u8, b: [*:0]const u8, b_index: usize) bool {
-        _ = ctx;
-        _ = b_index;
-        if (a == b) return true;
-        var len: usize = 0;
-        while (true) : (len += 1) {
-            if (a[len] == 0 and b[len] == 0) break;
-            if (a[len] == 0 and b[len] != 0) return false;
-            if (a[len] != 0 and b[len] == 0) return false;
-        }
-        return std.mem.eql(u8, a[0..len], b[0..len]);
-    }
-}, true);
-
 fn allocatorVulkanWrapper(p_allocator: *const std.mem.Allocator) vk.AllocationCallbacks {
     const static = struct {
         const Metadata = struct {
