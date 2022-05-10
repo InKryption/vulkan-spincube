@@ -138,14 +138,9 @@ const VkEngine = struct {
         const bd = try BaseDispatch.load(instanceProcLoader);
 
         const desired_extensions = try desiredInstanceExtensionNames(local_arena);
-        defer freeDesiredExtensionNames(local_arena, desired_extensions);
-
         const available_extensions = try enumerateInstanceExtensionPropertiesAlloc(local_arena, bd, null);
-        defer local_arena.free(available_extensions);
-
         const available_extension_set: std.StringArrayHashMap(void).Unmanaged = available_extension_set: {
             var available_extension_set = std.StringArrayHashMap(void).init(local_arena);
-            errdefer available_extension_set.deinit();
 
             for (available_extensions) |*ext| {
                 const str = std.mem.sliceTo(std.mem.span(&ext.extension_name), 0);
@@ -154,11 +149,6 @@ const VkEngine = struct {
 
             break :available_extension_set available_extension_set.unmanaged;
         };
-        defer {
-            var copy = available_extension_set;
-            copy.deinit(local_arena);
-        }
-
         const selected_extensions: []const [*:0]const u8 = selected_extensions: {
             var selected_extensions = std.ArrayList([*:0]const u8).init(local_arena);
             errdefer selected_extensions.deinit();
@@ -174,7 +164,11 @@ const VkEngine = struct {
 
             break :selected_extensions selected_extensions.toOwnedSlice();
         };
-        defer local_arena.free(selected_extensions);
+
+        std.log.debug("Found extensions:", .{});
+        for (available_extensions) |*ext| {
+            std.log.debug("  '{s}': {}", .{ std.mem.sliceTo(&ext.extension_name, 0), fmtApiVersion(ext.spec_version) });
+        }
 
         const inst_debug_messenger_creation_info = if (build_options.vk_validation_layers) vk.DebugUtilsMessengerCreateInfoEXT{
             .flags = .{},
@@ -195,7 +189,7 @@ const VkEngine = struct {
 
         const handle = try createInstance(allocator, bd, InstanceCreateInfo{
             .p_next = if (build_options.vk_validation_layers) &inst_debug_messenger_creation_info else null,
-            .enabled_extension_names = desired_extensions,
+            .enabled_extension_names = selected_extensions,
         });
         const dsp = InstanceDispatch.load(handle, instanceProcLoader) catch |err| {
             const min_dsp = InstanceDispatchMin.load(handle, instanceProcLoader) catch return err;

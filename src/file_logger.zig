@@ -1,7 +1,9 @@
 //! Small utility to redirect logs to a file.
 const std = @import("std");
 
+var log_file_writer_mutex: std.Thread.Mutex = .{};
 var log_file_writer: std.io.BufferedWriter(1024 * 8, std.fs.File.Writer) = undefined;
+
 pub fn init(rel_outpath: []const u8) !void {
     log_file_writer = .{
         .unbuffered_writer = .{
@@ -22,6 +24,9 @@ pub fn log(
     comptime format: []const u8,
     args: anytype,
 ) void {
+    log_file_writer_mutex.lock();
+    defer log_file_writer_mutex.unlock();
+
     const writer = log_file_writer.writer();
     writer.writeAll(message_level.asText()) catch return;
     if (scope != .default) {
