@@ -6,10 +6,14 @@ pub fn build(b: *std.build.Builder) void {
     const target = b.standardTargetOptions(.{});
     const mode = b.standardReleaseOptions();
 
-    const exe = b.addExecutable("vulkan-spincube", "src/main.zig");
+    const exe = b.addExecutable("vulkan-spincube", "src/root.zig");
     exe.setTarget(target);
     exe.setBuildMode(mode);
     exe.install();
+
+    const build_options = b.addOptions();
+    exe.addOptions("build_options", build_options);
+    build_options.addOption(bool, "vk_validation_layers", b.option(bool, "vk-validation-layers", "Enable Vulkan Validation Layers.") orelse (mode == .Debug));
 
     const vk_gen_step = vk.VkGenerateStep.init(b, "dep/KhronosGroup/Vulkan-Docs/xml/vk.xml", "generated/vk.zig");
     exe.step.dependOn(&vk_gen_step.step);

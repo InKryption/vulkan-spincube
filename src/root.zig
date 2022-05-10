@@ -1,0 +1,413 @@
+const std = @import("std");
+const build_options = @import("build_options");
+const builtin = @import("builtin");
+const vk = @import("vulkan");
+const glfw = @import("glfw");
+
+const BaseDispatch = vk.BaseWrapper(vk.BaseCommandFlags{
+    .createInstance = true,
+    .getInstanceProcAddr = true,
+    .enumerateInstanceVersion = true,
+    .enumerateInstanceLayerProperties = true,
+    .enumerateInstanceExtensionProperties = true,
+});
+const InstanceDispatchMin = vk.InstanceWrapper(.{ .destroyInstance = true });
+const InstanceDispatch = vk.InstanceWrapper(vk.InstanceCommandFlags{
+    .destroyInstance = true,
+    .enumeratePhysicalDevices = true,
+    .getDeviceProcAddr = true,
+
+    .getPhysicalDeviceProperties = true,
+    .getPhysicalDeviceQueueFamilyProperties = true,
+    .getPhysicalDeviceMemoryProperties = true,
+    .getPhysicalDeviceFeatures = true,
+    .getPhysicalDeviceFormatProperties = true,
+    .getPhysicalDeviceImageFormatProperties = true,
+
+    .createDevice = true,
+
+    .createDebugUtilsMessengerEXT = build_options.vk_validation_layers,
+    .destroyDebugUtilsMessengerEXT = build_options.vk_validation_layers,
+});
+
+fn getInstanceProcAddress(handle: vk.Instance, name: [*:0]const u8) ?*const anyopaque {
+    const inst_ptr = @intToPtr(?*anyopaque, @enumToInt(handle));
+    const result: glfw.VKProc = glfw.getInstanceProcAddress(inst_ptr, name) orelse return null;
+    return @ptrCast(*const anyopaque, result);
+}
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{ .verbose_log = false }){};
+    defer _ = gpa.deinit();
+
+    const allocator: std.mem.Allocator = gpa.allocator();
+
+    try glfw.init(.{});
+    defer glfw.terminate();
+
+    const engine = try VkEngine.init(allocator, getInstanceProcAddress);
+    defer engine.deinit(allocator);
+}
+
+const VkEngine = struct {
+    inst: VkInst,
+    debug_messenger: if (build_options.vk_validation_layers) vk.DebugUtilsMessengerEXT else void,
+
+    const VkInst = struct { handle: vk.Instance, dsp: InstanceDispatch };
+
+    pub fn init(allocator: std.mem.Allocator, instanceProcLoader: anytype) !VkEngine {
+        const inst: VkInst = try initVkInst(allocator, instanceProcLoader);
+        errdefer inst.dsp.destroyInstance(inst.handle, &allocatorVulkanWrapper(&allocator));
+
+        const debug_messenger = if (build_options.vk_validation_layers) try createDebugMessenger(allocator) else {};
+        errdefer if (build_options.vk_validation_layers) destroyDebugMessenger(allocator, inst, debug_messenger);
+
+        return VkEngine{
+            .inst = inst,
+            .debug_messenger = debug_messenger,
+        };
+    }
+    pub fn deinit(self: VkEngine, allocator: std.mem.Allocator) void {
+        if (build_options.vk_validation_layers) {
+            self.inst.dsp.destroyDebugUtilsMessengerEXT(self.inst.handle, self.debug_messenger, &allocatorVulkanWrapper(&allocator));
+        }
+        self.inst.dsp.destroyInstance(self.inst.handle, &allocatorVulkanWrapper(&allocator));
+    }
+
+    fn createDebugMessenger(allocator: std.mem.Allocator) !vk.DebugUtilsMessengerEXT {
+        _ = allocator;
+        return std.debug.todo("");
+    }
+    fn destroyDebugMessenger(allocator: std.mem.Allocator, inst: VkInst, debug_messenger: vk.DebugUtilsMessengerEXT) void {
+        inst.dsp.destroyDebugUtilsMessengerEXT(inst.handle, debug_messenger, &allocatorVulkanWrapper(&allocator));
+    }
+
+    fn initVkInst(allocator: std.mem.Allocator, instanceProcLoader: anytype) !VkInst {
+        var local_arena_state = std.heap.ArenaAllocator.init(allocator);
+        defer local_arena_state.deinit();
+
+        const local_arena = local_arena_state.allocator();
+
+        const bd = try BaseDispatch.load(instanceProcLoader);
+
+        const desired_extensions = try desiredInstanceExtensionNames(local_arena);
+        defer freeDesiredExtensionNames(local_arena, desired_extensions);
+
+        const available_extensions = try enumerateInstanceExtensionPropertiesAlloc(local_arena, bd, null);
+        defer local_arena.free(available_extensions);
+
+        const available_extension_set: std.StringArrayHashMap(void).Unmanaged = available_extension_set: {
+            var available_extension_set = std.StringArrayHashMap(void).init(local_arena);
+            errdefer available_extension_set.deinit();
+
+            for (available_extensions) |*ext| {
+                const str = std.mem.sliceTo(std.mem.span(&ext.extension_name), 0);
+                try available_extension_set.putNoClobber(str, {});
+            }
+
+            break :available_extension_set available_extension_set.unmanaged;
+        };
+        defer {
+            var copy = available_extension_set;
+            copy.deinit(local_arena);
+        }
+
+        const selected_extensions: []const [*:0]const u8 = selected_extensions: {
+            var selected_extensions = std.ArrayList([*:0]const u8).init(local_arena);
+            errdefer selected_extensions.deinit();
+
+            for (desired_extensions) |p_desired_extension| {
+                const desired_extension = std.mem.span(p_desired_extension);
+                if (available_extension_set.contains(desired_extension)) {
+                    try selected_extensions.append(desired_extension);
+                } else {
+                    std.log.warn("Desired extension '{s}' not available.", .{desired_extension});
+                }
+            }
+
+            break :selected_extensions selected_extensions.toOwnedSlice();
+        };
+        defer local_arena.free(selected_extensions);
+
+        const handle = try createInstance(allocator, bd, InstanceCreateInfo{
+            .enabled_extension_names = desired_extensions,
+        });
+        const dsp = InstanceDispatch.load(handle, instanceProcLoader) catch |err| {
+            const min_dsp = InstanceDispatchMin.load(handle, instanceProcLoader) catch return err;
+            min_dsp.destroyInstance(handle, &allocatorVulkanWrapper(&allocator));
+            return err;
+        };
+        errdefer dsp.destroyInstance(handle, &allocatorVulkanWrapper(&allocator));
+
+        return VkInst{
+            .handle = handle,
+            .dsp = dsp,
+        };
+    }
+    fn desiredInstanceExtensionNames(allocator: std.mem.Allocator) ![]const [*:0]const u8 {
+        var result = std.ArrayList([*:0]const u8).init(allocator);
+        errdefer {
+            for (result.items) |p_ext_name| {
+                const ext_name = std.mem.span(p_ext_name);
+                allocator.free(ext_name);
+            }
+            result.deinit();
+        }
+
+        const glfw_required_extensions = try glfw.getRequiredInstanceExtensions();
+        try result.ensureUnusedCapacity(glfw_required_extensions.len);
+        for (glfw_required_extensions) |p_ext_name| {
+            const ext_name = std.mem.span(p_ext_name);
+            result.appendAssumeCapacity(try allocator.dupeZ(u8, ext_name));
+        }
+
+        if (build_options.vk_validation_layers) {
+            try result.append(try allocator.dupeZ(u8, vk.extension_info.ext_debug_utils.name));
+        }
+
+        return result.toOwnedSlice();
+    }
+    fn freeDesiredExtensionNames(allocator: std.mem.Allocator, extension_names: []const [*:0]const u8) void {
+        for (extension_names) |p_ext_name| {
+            const ext_name = std.mem.span(p_ext_name);
+            allocator.free(ext_name);
+        }
+        allocator.free(extension_names);
+    }
+
+    pub const InstanceCreateInfo = struct {
+        flags: vk.InstanceCreateFlags = .{},
+        application_info: ?ApplicationInfo = null,
+
+        enabled_layer_names: []const [*:0]const u8 = &.{},
+        enabled_extension_names: []const [*:0]const u8 = &.{},
+
+        pub const ApplicationInfo = struct {
+            application_name: ?[:0]const u8,
+            application_version: u32,
+
+            engine_name: ?[:0]const u8,
+            engine_version: u32,
+
+            api_version: ApiVersion,
+
+            pub const ApiVersion = enum(u32) {
+                @"1_0" = vk.API_VERSION_1_0,
+                @"1_1" = vk.API_VERSION_1_1,
+                @"1_2" = vk.API_VERSION_1_2,
+                @"1_3" = vk.API_VERSION_1_3,
+                _,
+            };
+        };
+    };
+    pub fn createInstance(
+        allocator: std.mem.Allocator,
+        bd: BaseDispatch,
+        instance_create_info: InstanceCreateInfo,
+    ) !vk.Instance {
+        const maybe_app_info: ?vk.ApplicationInfo = if (instance_create_info.application_info) |app_info| vk.ApplicationInfo{
+            .p_application_name = if (app_info.application_name) |app_name| app_name.ptr else null,
+            .application_version = app_info.application_version,
+
+            .p_engine_name = if (app_info.engine_name) |engine_name| engine_name.ptr else null,
+            .engine_version = app_info.engine_version,
+
+            .api_version = @enumToInt(app_info.api_version),
+        } else null;
+        const p_app_info: ?*const vk.ApplicationInfo = if (maybe_app_info) |*app_info| app_info else null;
+
+        const create_info = vk.InstanceCreateInfo{
+            .flags = instance_create_info.flags,
+            .p_application_info = p_app_info,
+
+            .enabled_layer_count = @intCast(u32, instance_create_info.enabled_layer_names.len),
+            .pp_enabled_layer_names = instance_create_info.enabled_layer_names.ptr,
+
+            .enabled_extension_count = @intCast(u32, instance_create_info.enabled_extension_names.len),
+            .pp_enabled_extension_names = instance_create_info.enabled_extension_names.ptr,
+        };
+
+        return bd.createInstance(&create_info, &allocatorVulkanWrapper(&allocator));
+    }
+    pub fn enumerateInstanceLayerPropertiesAlloc(
+        allocator: std.mem.Allocator,
+        bd: BaseDispatch,
+    ) ![]vk.LayerProperties {
+        var count: u32 = undefined;
+        if (bd.enumerateInstanceLayerProperties(&count, null)) |result| switch (result) {
+            .success => {},
+            else => unreachable,
+        } else |err| return err;
+
+        const layers = try allocator.alloc(vk.LayerProperties, count);
+        errdefer allocator.free(layers);
+
+        if (bd.enumerateInstanceLayerProperties(&count, layers.ptr)) |result| switch (result) {
+            .success => {},
+            else => unreachable,
+        } else |err| return err;
+
+        std.debug.assert(layers.len == count);
+        return layers;
+    }
+    pub fn enumerateInstanceExtensionPropertiesAlloc(
+        allocator: std.mem.Allocator,
+        bd: BaseDispatch,
+        layer_name: ?[:0]const u8,
+    ) ![]vk.ExtensionProperties {
+        const p_layer_name: ?[*:0]const u8 = if (layer_name) |ln| ln.ptr else null;
+
+        var count: u32 = undefined;
+        if (bd.enumerateInstanceExtensionProperties(p_layer_name, &count, null)) |result| switch (result) {
+            .success => {},
+            else => unreachable,
+        } else |err| return err;
+
+        const extensions = try allocator.alloc(vk.ExtensionProperties, count);
+        errdefer allocator.free(extensions);
+
+        if (bd.enumerateInstanceExtensionProperties(p_layer_name, &count, extensions.ptr)) |result| switch (result) {
+            .success => {},
+            else => unreachable,
+        } else |err| return err;
+
+        std.debug.assert(extensions.len == count);
+        return extensions;
+    }
+    pub fn enumerateInstanceExtensionPropertiesMultipleLayersAlloc(
+        allocator: std.mem.Allocator,
+        bd: BaseDispatch,
+        include_base: bool,
+        layer_names: []const [:0]const u8,
+    ) ![]vk.ExtensionProperties {
+        const counts = try allocator.alloc(u32, @boolToInt(include_base) + layer_names.len);
+        defer allocator.free(counts);
+
+        for (layer_names) |layer_name, i| {
+            if (bd.enumerateInstanceExtensionProperties(layer_name.ptr, &counts[i], null)) |result| switch (result) {
+                .success => {},
+                else => unreachable,
+            } else |err| return err;
+        }
+
+        const extensions = try allocator.alloc(vk.ExtensionProperties, full_count: {
+            var full_count: usize = 0;
+            for (counts) |count| {
+                full_count += count;
+            }
+            break :full_count full_count;
+        });
+        errdefer allocator.free(extensions);
+
+        {
+            var start: usize = 0;
+            for (layer_names) |layer_name, i| {
+                const len = counts[i];
+
+                if (bd.enumerateInstanceExtensionProperties(layer_name.ptr, &counts[i], extensions[start .. start + len].ptr)) |result| switch (result) {
+                    .success => {},
+                    else => unreachable,
+                } else |err| return err;
+
+                std.debug.assert(len == counts[i]);
+                start += len;
+            }
+        }
+
+        return extensions;
+    }
+};
+
+fn allocatorVulkanWrapper(p_allocator: *const std.mem.Allocator) vk.AllocationCallbacks {
+    const static = struct {
+        const Metadata = struct {
+            len: usize,
+            alignment: u29,
+        };
+        fn allocation(
+            p_user_data: ?*anyopaque,
+            size: usize,
+            alignment: usize,
+            allocation_scope: vk.SystemAllocationScope,
+        ) callconv(vk.vulkan_call_conv) ?*anyopaque {
+            _ = allocation_scope;
+            const allocator = @ptrCast(*const std.mem.Allocator, @alignCast(@alignOf(std.mem.Allocator), p_user_data)).*;
+
+            if (size == 0) return null;
+
+            const bytes = allocator.allocBytes(@intCast(u29, alignment), @sizeOf(Metadata) + size, 0, @returnAddress()) catch return null;
+            std.mem.bytesAsValue(Metadata, bytes[0..@sizeOf(Metadata)]).* = .{
+                .len = size,
+                .alignment = @intCast(u29, alignment),
+            };
+
+            return @ptrCast(*anyopaque, bytes[@sizeOf(Metadata)..].ptr);
+        }
+
+        fn reallocation(
+            p_user_data: ?*anyopaque,
+            p_original: ?*anyopaque,
+            size: usize,
+            alignment: usize,
+            allocation_scope: vk.SystemAllocationScope,
+        ) callconv(vk.vulkan_call_conv) ?*anyopaque {
+            const allocator = @ptrCast(*const std.mem.Allocator, @alignCast(@alignOf(std.mem.Allocator), p_user_data)).*;
+
+            const old_ptr = (@ptrCast([*]u8, p_original orelse return allocation(p_user_data, size, alignment, allocation_scope)) - @sizeOf(Metadata));
+            const old_metadata = std.mem.bytesToValue(Metadata, old_ptr[0..@sizeOf(Metadata)]);
+
+            const old_bytes = old_ptr[0 .. @sizeOf(Metadata) + old_metadata.len];
+            const new_bytes = allocator.reallocBytes(old_bytes, old_metadata.alignment, size, @intCast(u29, alignment), 0, @returnAddress()) catch return null;
+
+            std.mem.bytesAsValue(Metadata, new_bytes[0..@sizeOf(Metadata)]).* = .{
+                .len = size,
+                .alignment = @intCast(u29, alignment),
+            };
+            return @ptrCast(*anyopaque, new_bytes[@sizeOf(Metadata)..].ptr);
+        }
+
+        fn free(
+            p_user_data: ?*anyopaque,
+            p_memory: ?*anyopaque,
+        ) callconv(vk.vulkan_call_conv) void {
+            const allocator = @ptrCast(*const std.mem.Allocator, @alignCast(@alignOf(std.mem.Allocator), p_user_data)).*;
+
+            const ptr = (@ptrCast([*]u8, p_memory orelse return) - @sizeOf(Metadata));
+            const metadata = std.mem.bytesToValue(Metadata, ptr[0..@sizeOf(Metadata)]);
+
+            const bytes = ptr[0 .. @sizeOf(Metadata) + metadata.len];
+            return allocator.rawFree(bytes, metadata.alignment, @returnAddress());
+        }
+    };
+    return vk.AllocationCallbacks{
+        .p_user_data = @intToPtr(*anyopaque, @ptrToInt(p_allocator)),
+        .pfn_allocation = static.allocation,
+        .pfn_reallocation = static.reallocation,
+        .pfn_free = static.free,
+        .pfn_internal_allocation = null,
+        .pfn_internal_free = null,
+    };
+}
+
+fn fmtApiVersion(version_bits: u32) std.fmt.Formatter(formatApiVersion) {
+    return .{ .data = version_bits };
+}
+fn formatApiVersion(
+    version_bits: u32,
+    comptime fmt_str: []const u8,
+    options: std.fmt.FormatOptions,
+    writer: anytype,
+) @TypeOf(writer).Error!void {
+    _ = fmt_str;
+    _ = options;
+
+    const variant = vk.apiVersionVariant(version_bits);
+    const major = vk.apiVersionMajor(version_bits);
+    const minor = vk.apiVersionMinor(version_bits);
+    const patch = vk.apiVersionPatch(version_bits);
+
+    if (comptime fmt_str.len > 0 and fmt_str[0] == 'v') {
+        try writer.print("{d}.", .{variant});
+    }
+    try writer.print("{d}.{d}.{d}", .{ major, minor, patch });
+}
