@@ -1,6 +1,6 @@
 const std = @import("std");
-const build_options = @import("build_options");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 const vk = @import("vulkan");
 const glfw = @import("glfw");
 
@@ -40,7 +40,7 @@ const file_logger = @import("file_logger.zig");
 pub const log = file_logger.log;
 
 pub fn main() !void {
-    try file_logger.init("run.log");
+    try file_logger.init("vulkan-spincube.log");
     defer file_logger.deinit();
 
     var gpa = std.heap.GeneralPurposeAllocator(.{ .verbose_log = false }){};
