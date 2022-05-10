@@ -59,8 +59,8 @@ const VkEngine = struct {
         const inst: VkInst = try initVkInst(allocator, instanceProcLoader);
         errdefer inst.dsp.destroyInstance(inst.handle, &allocatorVulkanWrapper(&allocator));
 
-        const debug_messenger = if (build_options.vk_validation_layers) try createDebugMessenger(allocator) else {};
-        errdefer if (build_options.vk_validation_layers) destroyDebugMessenger(allocator, inst, debug_messenger);
+        const debug_messenger = if (build_options.vk_validation_layers) try createVkDebugMessenger(allocator, inst) else {};
+        errdefer if (build_options.vk_validation_layers) destroyVkDebugMessenger(allocator, inst, debug_messenger);
 
         return VkEngine{
             .inst = inst,
@@ -74,12 +74,53 @@ const VkEngine = struct {
         self.inst.dsp.destroyInstance(self.inst.handle, &allocatorVulkanWrapper(&allocator));
     }
 
-    fn createDebugMessenger(allocator: std.mem.Allocator) !vk.DebugUtilsMessengerEXT {
-        _ = allocator;
-        return std.debug.todo("");
+    fn createVkDebugMessenger(allocator: std.mem.Allocator, inst: VkInst) !vk.DebugUtilsMessengerEXT {
+        return inst.dsp.createDebugUtilsMessengerEXT(inst.handle, &vk.DebugUtilsMessengerCreateInfoEXT{
+            .flags = vk.DebugUtilsMessengerCreateFlagsEXT{},
+            .message_severity = vk.DebugUtilsMessageSeverityFlagsEXT{
+                .verbose_bit_ext = true,
+                .info_bit_ext = true,
+                .warning_bit_ext = true,
+                .error_bit_ext = true,
+            },
+            .message_type = vk.DebugUtilsMessageTypeFlagsEXT{
+                .general_bit_ext = true,
+                .validation_bit_ext = true,
+                .performance_bit_ext = true,
+            },
+            .pfn_user_callback = vulkanDebugMessengerCallback,
+            .p_user_data = null,
+        }, &allocatorVulkanWrapper(&allocator));
     }
-    fn destroyDebugMessenger(allocator: std.mem.Allocator, inst: VkInst, debug_messenger: vk.DebugUtilsMessengerEXT) void {
+    fn destroyVkDebugMessenger(allocator: std.mem.Allocator, inst: VkInst, debug_messenger: vk.DebugUtilsMessengerEXT) void {
         inst.dsp.destroyDebugUtilsMessengerEXT(inst.handle, debug_messenger, &allocatorVulkanWrapper(&allocator));
+    }
+    fn vulkanDebugMessengerCallback(
+        msg_severity_int: vk.DebugUtilsMessageSeverityFlagsEXT.IntType,
+        message_types: vk.DebugUtilsMessageTypeFlagsEXT.IntType,
+        opt_p_callback_data: ?*const vk.DebugUtilsMessengerCallbackDataEXT,
+        p_user_data: ?*anyopaque,
+    ) callconv(vk.vulkan_call_conv) vk.Bool32 {
+        _ = message_types;
+        _ = p_user_data;
+
+        const logger = std.log.scoped(.vulkan_debug_messenger);
+        const msg_severity = @bitCast(vk.DebugUtilsMessageSeverityFlagsEXT, msg_severity_int);
+        const level: std.log.Level = if (msg_severity.error_bit_ext)
+            .err
+        else if (msg_severity.warning_bit_ext)
+            .warn
+        else if (msg_severity.info_bit_ext) .info else std.log.Level.debug;
+
+        const p_callback_data = opt_p_callback_data orelse return vk.FALSE;
+        switch (level) {
+            .err => logger.err("{s}", .{p_callback_data.p_message}),
+            .warn => logger.warn("{s}", .{p_callback_data.p_message}),
+            .info => logger.info("{s}", .{p_callback_data.p_message}),
+            .debug => logger.debug("{s}", .{p_callback_data.p_message}),
+        }
+
+        return vk.FALSE;
     }
 
     fn initVkInst(allocator: std.mem.Allocator, instanceProcLoader: anytype) !VkInst {
@@ -129,7 +170,25 @@ const VkEngine = struct {
         };
         defer local_arena.free(selected_extensions);
 
+        const inst_debug_messenger_creation_info = if (build_options.vk_validation_layers) vk.DebugUtilsMessengerCreateInfoEXT{
+            .flags = .{},
+            .message_severity = vk.DebugUtilsMessageSeverityFlagsEXT{
+                .verbose_bit_ext = true,
+                .info_bit_ext = true,
+                .warning_bit_ext = true,
+                .error_bit_ext = true,
+            },
+            .message_type = vk.DebugUtilsMessageTypeFlagsEXT{
+                .general_bit_ext = true,
+                .validation_bit_ext = true,
+                .performance_bit_ext = true,
+            },
+            .pfn_user_callback = vulkanDebugMessengerCallback,
+            .p_user_data = null,
+        } else void{};
+
         const handle = try createInstance(allocator, bd, InstanceCreateInfo{
+            .p_next = if (build_options.vk_validation_layers) &inst_debug_messenger_creation_info else null,
             .enabled_extension_names = desired_extensions,
         });
         const dsp = InstanceDispatch.load(handle, instanceProcLoader) catch |err| {
@@ -176,6 +235,8 @@ const VkEngine = struct {
     }
 
     pub const InstanceCreateInfo = struct {
+        p_next: ?*const anyopaque = null,
+
         flags: vk.InstanceCreateFlags = .{},
         application_info: ?ApplicationInfo = null,
 
@@ -217,6 +278,8 @@ const VkEngine = struct {
         const p_app_info: ?*const vk.ApplicationInfo = if (maybe_app_info) |*app_info| app_info else null;
 
         const create_info = vk.InstanceCreateInfo{
+            .p_next = instance_create_info.p_next,
+
             .flags = instance_create_info.flags,
             .p_application_info = p_app_info,
 
