@@ -1,6 +1,6 @@
 const std = @import("std");
 const vk = @import("dep/Snektron/vulkan-zig/generator/index.zig");
-const mach_glfw = @import("dep/hexops/mach/glfw/build.zig");
+const mach = @import("dep/hexops/mach/build.zig");
 
 pub fn build(b: *std.build.Builder) void {
     const target = b.standardTargetOptions(.{});
@@ -15,8 +15,8 @@ pub fn build(b: *std.build.Builder) void {
     exe.step.dependOn(&vk_gen_step.step);
     exe.addPackage(vk_gen_step.package);
 
-    mach_glfw.link(b, exe, mach_glfw.Options{ .vulkan = true });
-    exe.addPackage(mach_glfw.pkg);
+    mach.glfw.link(b, exe, mach.glfw.Options{ .vulkan = true });
+    exe.addPackage(mach.glfw.pkg);
 
     const run_cmd = exe.run();
     run_cmd.step.dependOn(b.getInstallStep());
