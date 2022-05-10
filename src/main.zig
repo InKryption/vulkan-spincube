@@ -35,32 +35,63 @@ pub fn main() !void {
     defer _ = gpa.deinit();
 
     const allocator: std.mem.Allocator = gpa.allocator();
-    _ = allocator;
 
     try glfw.init(.{});
     defer glfw.terminate();
 
-    const inst: VkInstance = try VkInstance.create(allocator, getInstanceProcAddress, .{
+    const engine: VkEngine = try VkEngine.init(allocator, getInstanceProcAddress, .{
         .desired_layers = &.{},
-        .desired_extensions = try glfw.getRequiredInstanceExtensions(),
+        .desired_extensions = &.{},
     });
-    defer inst.dsp.destroyInstance(inst.handle, &allocatorVulkanWrapper(&allocator));
+    defer engine.deinit(allocator);
 }
 
-const VkInstance = struct {
-    handle: vk.Instance,
-    dsp: InstanceDispatch,
+const VkEngine = struct {
+    inst: VkInstance,
 
-    const CreateArgs = struct {
-        desired_layers: []const [*:0]const u8,
-        desired_extensions: []const [*:0]const u8,
+    pub fn init(
+        allocator: std.mem.Allocator,
+        instanceProcLoader: anytype,
+        create_instance_args: CreateVkInstanceArgs,
+    ) !VkEngine {
+        const inst = try createVkInstance(allocator, instanceProcLoader, create_instance_args);
+        errdefer destroyVkInstance(allocator, inst);
+
+        return VkEngine{
+            .inst = inst,
+        };
+    }
+
+    pub fn deinit(self: VkEngine, allocator: std.mem.Allocator) void {
+        destroyVkInstance(allocator, self.inst);
+    }
+
+    const VkInstance = struct {
+        handle: vk.Instance,
+        dsp: InstanceDispatch,
     };
-    fn create(
+
+    const CreateVkInstanceArgs = struct {
+        desired_layers: []const [*:0]const u8 = &.{},
+        desired_layers_if_not_found: []const NotFoundStrategy = &.{},
+
+        desired_extensions: []const [*:0]const u8 = &.{},
+        desired_extensions_if_not_found: []const NotFoundStrategy = &.{},
+
+        desired_layers_if_not_found_default: NotFoundStrategy = .err,
+        desired_extensions_if_not_found_default: NotFoundStrategy = .err,
+
+        const NotFoundStrategy = enum { silent, log, err };
+    };
+    fn createVkInstance(
         allocator: std.mem.Allocator,
         loader: anytype,
-        args: CreateArgs,
+        args: CreateVkInstanceArgs,
     ) !VkInstance {
-        const vk_allocator: vk.AllocationCallbacks = allocatorVulkanWrapper(&allocator);
+        std.debug.assert(args.desired_extensions_if_not_found.len <= args.desired_extensions.len);
+        std.debug.assert(args.desired_layers_if_not_found.len <= args.desired_layers.len);
+
+        const p_vk_allocator: *const vk.AllocationCallbacks = &allocatorVulkanWrapper(&allocator);
         const bd = try BaseDispatch.load(loader);
 
         var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -73,6 +104,71 @@ const VkInstance = struct {
         const available_layers: []const vk.LayerProperties = try enumerateInstanceLayerPropertiesAlloc(arena, bd);
         const available_extensions: []const vk.ExtensionProperties = try enumerateInstanceExtensionPropertiesAlloc(arena, bd, null);
         try logLayersAndExtensions(arena, available_layers, available_extensions);
+
+        for (args.desired_layers) |p_layer_name, i| {
+            const not_found_strat: CreateVkInstanceArgs.NotFoundStrategy = if (i < args.desired_layers_if_not_found.len)
+                args.desired_layers_if_not_found[i]
+            else
+                args.desired_layers_if_not_found_default;
+            const layer_name: []const u8 = std.mem.span(p_layer_name);
+
+            const key: vk.LayerProperties = key: {
+                var key: vk.LayerProperties = undefined;
+                std.debug.assert(layer_name.len <= key.layer_name.len);
+                std.mem.set(u8, &key.layer_name, 0);
+                std.mem.copy(u8, &key.layer_name, layer_name);
+                break :key key;
+            };
+
+            const index = std.sort.binarySearch(vk.LayerProperties, key, available_layers, void{}, struct {
+                fn compare(ctx: void, lhs: vk.LayerProperties, rhs: vk.LayerProperties) std.math.Order {
+                    _ = ctx;
+                    return std.mem.order(u8, &lhs.layer_name, &rhs.layer_name);
+                }
+            }.compare);
+            if (index == null) {
+                switch (not_found_strat) {
+                    .silent => {},
+                    .log, .err => std.log.err("Failed to find instance layer '{s}'.", .{layer_name}),
+                }
+                switch (not_found_strat) {
+                    .silent, .log => {},
+                    .err => return error.DesiredInstanceLayerNotFound,
+                }
+            }
+        }
+
+        for (args.desired_extensions) |p_extension_name, i| {
+            const not_found_strat: CreateVkInstanceArgs.NotFoundStrategy = if (i < args.desired_extensions_if_not_found.len)
+                args.desired_extensions_if_not_found[i]
+            else
+                args.desired_extensions_if_not_found_default;
+            const extension_name = std.mem.span(p_extension_name);
+
+            const key: vk.ExtensionProperties = key: {
+                var key: vk.ExtensionProperties = undefined;
+                std.mem.set(u8, &key.extension_name, 0);
+                std.mem.copy(u8, &key.extension_name, extension_name);
+                break :key key;
+            };
+
+            const index = std.sort.binarySearch(vk.ExtensionProperties, key, available_extensions, void{}, struct {
+                fn compare(ctx: void, lhs: vk.ExtensionProperties, rhs: vk.ExtensionProperties) std.math.Order {
+                    _ = ctx;
+                    return std.mem.order(u8, &lhs.extension_name, &rhs.extension_name);
+                }
+            }.compare);
+            if (index == null) {
+                switch (not_found_strat) {
+                    .silent => {},
+                    .log, .err => std.log.err("Failed to find instance extension '{s}'.", .{extension_name}),
+                }
+                switch (not_found_strat) {
+                    .silent, .log => {},
+                    .err => return error.DesiredInstanceExtensionNotFound,
+                }
+            }
+        }
 
         const handle = try bd.createInstance(&vk.InstanceCreateInfo{
             .flags = vk.InstanceCreateFlags{},
@@ -96,10 +192,10 @@ const VkInstance = struct {
 
             .enabled_extension_count = @intCast(u32, args.desired_extensions.len),
             .pp_enabled_extension_names = args.desired_extensions.ptr,
-        }, &vk_allocator);
+        }, p_vk_allocator);
         const dsp = InstanceDispatch.load(handle, getInstanceProcAddress) catch |err| {
             if (InstanceDispatchMin.load(handle, getInstanceProcAddress)) |inst_dsp_min| {
-                inst_dsp_min.destroyInstance(handle, &vk_allocator);
+                inst_dsp_min.destroyInstance(handle, p_vk_allocator);
             } else |_| {
                 std.log.warn("Failed to load function to destroy vulkan instance before encountering error; cleanup not possible.", .{});
             }
@@ -109,6 +205,9 @@ const VkInstance = struct {
             .handle = handle,
             .dsp = dsp,
         };
+    }
+    fn destroyVkInstance(allocator: std.mem.Allocator, inst: VkInstance) void {
+        inst.dsp.destroyInstance(inst.handle, &allocatorVulkanWrapper(&allocator));
     }
 
     fn logLayersAndExtensions(
@@ -120,7 +219,7 @@ const VkInstance = struct {
         defer log_buffer.deinit();
 
         log_buffer.shrinkRetainingCapacity(0);
-        try log_buffer.writer().writeAll("Found Layers:\n");
+        try log_buffer.writer().writeAll("Available Layers:\n");
         for (available_layers) |*layer| {
             try log_buffer.writer().print(
                 \\(*) Name: {s}
@@ -140,7 +239,7 @@ const VkInstance = struct {
         std.log.debug("{s}\n", .{log_buffer.items});
 
         log_buffer.shrinkRetainingCapacity(0);
-        try log_buffer.writer().writeAll("Found Extensions:\n");
+        try log_buffer.writer().writeAll("Available Extensions:\n");
         for (available_extensions) |*extension| {
             try log_buffer.writer().print(
                 \\(*) {s}: {}
@@ -151,6 +250,7 @@ const VkInstance = struct {
 
         std.log.debug("{s}\n", .{log_buffer.items});
     }
+
     fn enumerateInstanceLayerPropertiesAlloc(
         allocator: std.mem.Allocator,
         bd: BaseDispatch,
