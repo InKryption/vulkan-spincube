@@ -36,7 +36,13 @@ fn getInstanceProcAddress(handle: vk.Instance, name: [*:0]const u8) ?*const anyo
     return @ptrCast(*const anyopaque, result);
 }
 
+const file_logger = @import("file_logger.zig");
+pub const log = file_logger.log;
+
 pub fn main() !void {
+    try file_logger.init("run.log");
+    defer file_logger.deinit();
+
     var gpa = std.heap.GeneralPurposeAllocator(.{ .verbose_log = false }){};
     defer _ = gpa.deinit();
 
