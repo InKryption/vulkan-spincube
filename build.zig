@@ -14,6 +14,11 @@ pub fn build(b: *std.build.Builder) void {
     const build_options = b.addOptions();
     exe.addOptions("build_options", build_options);
     build_options.addOption(bool, "vk_validation_layers", b.option(bool, "vk-validation-layers", "Enable Vulkan Validation Layers.") orelse (mode == .Debug));
+    build_options.addOption(std.log.Level, "log_level", b.option(std.log.Level, "log-level", "Sets the log level.") orelse switch (mode) {
+        .Debug => std.log.Level.debug,
+        .ReleaseSafe => std.log.Level.info,
+        .ReleaseFast, .ReleaseSmall => std.log.Level.err,
+    });
 
     const vk_gen_step = vk.VkGenerateStep.init(b, "dep/KhronosGroup/Vulkan-Docs/xml/vk.xml", "generated/vk.zig");
     exe.step.dependOn(&vk_gen_step.step);
