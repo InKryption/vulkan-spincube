@@ -137,6 +137,35 @@ const VkEngine = struct {
 
         const bd = try BaseDispatch.load(instanceProcLoader);
 
+        const desired_layers = try desiredInstanceLayerNames(local_arena);
+        const available_layers: []const vk.LayerProperties = try enumerateInstanceLayerPropertiesAlloc(local_arena, bd);
+        const available_layer_set: std.StringArrayHashMap(void).Unmanaged = available_layer_set: {
+            var available_layer_set = std.StringArrayHashMap(void).init(local_arena);
+
+            for (available_layers) |*layer| {
+                const str = std.mem.sliceTo(std.mem.span(&layer.layer_name), 0);
+                try available_layer_set.putNoClobber(str, {});
+            }
+
+            break :available_layer_set available_layer_set.unmanaged;
+        };
+        const selected_layers: std.ArrayHashMapUnmanaged([*:0]const u8, void, ArrayCStringContext, true) = selected_layers: {
+            var selected_layers = std.ArrayHashMap([*:0]const u8, void, ArrayCStringContext, true).init(local_arena);
+            errdefer selected_layers.deinit();
+
+            try selected_layers.ensureUnusedCapacity(desired_layers.len);
+            for (desired_layers) |p_desired_layer| {
+                const desired_layer = std.mem.span(p_desired_layer);
+                if (available_layer_set.contains(desired_layer)) {
+                    selected_layers.putAssumeCapacityNoClobber(desired_layer, {});
+                } else {
+                    std.log.warn("Desired layer '{s}' not available.", .{desired_layer});
+                }
+            }
+
+            break :selected_layers selected_layers.unmanaged;
+        };
+
         const desired_extensions = try desiredInstanceExtensionNames(local_arena);
         const available_extensions = try enumerateInstanceExtensionPropertiesAlloc(local_arena, bd, null);
         const available_extension_set: std.StringArrayHashMap(void).Unmanaged = available_extension_set: {
@@ -149,25 +178,69 @@ const VkEngine = struct {
 
             break :available_extension_set available_extension_set.unmanaged;
         };
-        const selected_extensions: []const [*:0]const u8 = selected_extensions: {
-            var selected_extensions = std.ArrayList([*:0]const u8).init(local_arena);
+        const selected_extensions: std.ArrayHashMapUnmanaged([*:0]const u8, void, ArrayCStringContext, true) = selected_extensions: {
+            var selected_extensions = std.ArrayHashMap([*:0]const u8, void, ArrayCStringContext, true).init(allocator);
             errdefer selected_extensions.deinit();
 
+            try selected_extensions.ensureUnusedCapacity(desired_extensions.len);
             for (desired_extensions) |p_desired_extension| {
                 const desired_extension = std.mem.span(p_desired_extension);
                 if (available_extension_set.contains(desired_extension)) {
-                    try selected_extensions.append(desired_extension);
+                    selected_extensions.putAssumeCapacityNoClobber(desired_extension, {});
                 } else {
                     std.log.warn("Desired extension '{s}' not available.", .{desired_extension});
                 }
             }
 
-            break :selected_extensions selected_extensions.toOwnedSlice();
+            break :selected_extensions selected_extensions.unmanaged;
         };
 
-        std.log.debug("Found extensions:", .{});
-        for (available_extensions) |*ext| {
-            std.log.debug("  '{s}': {}", .{ std.mem.sliceTo(&ext.extension_name, 0), fmtApiVersion(ext.spec_version) });
+        {
+            var log_buff = std.ArrayList(u8).init(local_arena);
+            defer log_buff.deinit();
+            const log_buff_writer = log_buff.writer();
+
+            if (selected_layers.count() != 0) {
+                log_buff.shrinkRetainingCapacity(0);
+                try log_buff_writer.writeAll("Selected layers:\n");
+                for (available_layers) |*layer| {
+                    if (!selected_layers.contains(std.meta.assumeSentinel(std.mem.sliceTo(&layer.layer_name, 0), 0))) {
+                        continue;
+                    }
+                    try log_buff_writer.print(
+                        \\ * {s}: {s}
+                        \\     Impl: {}
+                        \\     Spec: {}
+                        \\
+                    ,
+                        .{
+                            std.mem.sliceTo(&layer.layer_name, 0),
+                            std.mem.span(&layer.description),
+                            fmtApiVersion(layer.implementation_version),
+                            fmtApiVersion(layer.spec_version),
+                        },
+                    );
+                }
+                std.log.debug("{s}", .{log_buff.items});
+            }
+
+            if (selected_extensions.count() != 0) {
+                log_buff.shrinkRetainingCapacity(0);
+                try log_buff_writer.writeAll("Selected extensions:\n");
+                for (available_extensions) |*ext| {
+                    if (!selected_extensions.contains(std.meta.assumeSentinel(std.mem.sliceTo(&ext.extension_name, 0), 0))) {
+                        continue;
+                    }
+                    try log_buff_writer.print(
+                        " * '{s}': {}\n",
+                        .{
+                            std.mem.sliceTo(&ext.extension_name, 0),
+                            fmtApiVersion(ext.spec_version),
+                        },
+                    );
+                }
+                std.log.debug("{s}", .{log_buff.items});
+            }
         }
 
         const inst_debug_messenger_creation_info = if (build_options.vk_validation_layers) vk.DebugUtilsMessengerCreateInfoEXT{
@@ -189,7 +262,8 @@ const VkEngine = struct {
 
         const handle = try createInstance(allocator, bd, InstanceCreateInfo{
             .p_next = if (build_options.vk_validation_layers) &inst_debug_messenger_creation_info else null,
-            .enabled_extension_names = selected_extensions,
+            .enabled_layer_names = selected_layers.keys(),
+            .enabled_extension_names = selected_extensions.keys(),
         });
         const dsp = InstanceDispatch.load(handle, instanceProcLoader) catch |err| {
             const min_dsp = InstanceDispatchMin.load(handle, instanceProcLoader) catch return err;
@@ -203,15 +277,16 @@ const VkEngine = struct {
             .dsp = dsp,
         };
     }
+
+    fn desiredInstanceLayerNames(allocator: std.mem.Allocator) ![]const [*:0]const u8 {
+        var result = std.ArrayList([*:0]const u8).init(allocator);
+        errdefer freeCStringSlice(allocator, result.toOwnedSlice());
+
+        return result.toOwnedSlice();
+    }
     fn desiredInstanceExtensionNames(allocator: std.mem.Allocator) ![]const [*:0]const u8 {
         var result = std.ArrayList([*:0]const u8).init(allocator);
-        errdefer {
-            for (result.items) |p_ext_name| {
-                const ext_name = std.mem.span(p_ext_name);
-                allocator.free(ext_name);
-            }
-            result.deinit();
-        }
+        errdefer freeCStringSlice(allocator, result.toOwnedSlice());
 
         const glfw_required_extensions = try glfw.getRequiredInstanceExtensions();
         try result.ensureUnusedCapacity(glfw_required_extensions.len);
@@ -226,7 +301,7 @@ const VkEngine = struct {
 
         return result.toOwnedSlice();
     }
-    fn freeDesiredExtensionNames(allocator: std.mem.Allocator, extension_names: []const [*:0]const u8) void {
+    fn freeCStringSlice(allocator: std.mem.Allocator, extension_names: []const [*:0]const u8) void {
         for (extension_names) |p_ext_name| {
             const ext_name = std.mem.span(p_ext_name);
             allocator.free(ext_name);
@@ -474,3 +549,14 @@ fn formatApiVersion(
     }
     try writer.print("{d}.{d}.{d}", .{ major, minor, patch });
 }
+
+const ArrayCStringContext = struct {
+    pub fn hash(ctx: @This(), p_str: [*:0]const u8) u32 {
+        _ = ctx;
+        return std.array_hash_map.StringContext.hash(.{}, std.mem.span(p_str));
+    }
+    pub fn eql(ctx: @This(), a: [*:0]const u8, b: [*:0]const u8, b_index: usize) bool {
+        _ = ctx;
+        return std.array_hash_map.StringContext.eql(.{}, std.mem.span(a), std.mem.span(b), b_index);
+    }
+};
