@@ -110,6 +110,10 @@ const VkEngine = struct {
         self.inst.dsp.destroyInstance(self.inst.handle, &allocatorVulkanWrapper(&allocator));
     }
 
+    pub fn getCoreDeviceQueue(self: VkEngine, comptime id: QueueFamilyId, index: u32) vk.Queue {
+        return self.device.dsp.getDeviceQueue(self.device.handle, @field(self.queue_family_indices, @tagName(id)), index);
+    }
+
     fn initVkInst(allocator: std.mem.Allocator, instanceProcLoader: anytype) !VkInst {
         var local_arena_state = std.heap.ArenaAllocator.init(allocator);
         defer local_arena_state.deinit();
