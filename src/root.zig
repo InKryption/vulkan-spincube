@@ -193,9 +193,10 @@ const VkEngine = struct {
         const available_layer_set: std.StringArrayHashMap(void).Unmanaged = available_layer_set: {
             var available_layer_set = std.StringArrayHashMap(void).init(local_arena);
 
+            try available_layer_set.ensureUnusedCapacity(available_layers.len);
             for (available_layers) |*layer| {
                 const str = std.mem.sliceTo(std.mem.span(&layer.layer_name), 0);
-                try available_layer_set.putNoClobber(str, {});
+                available_layer_set.putAssumeCapacityNoClobber(str, {});
             }
 
             break :available_layer_set available_layer_set.unmanaged;
@@ -239,7 +240,7 @@ const VkEngine = struct {
                 if (available_extension_set.contains(desired_extension)) {
                     selected_extensions.putAssumeCapacityNoClobber(desired_extension, {});
                 } else {
-                    std.log.warn("Desired extension '{s}' not available.", .{desired_extension});
+                    std.log.warn("Desired instance extension '{s}' not available.", .{desired_extension});
                 }
             }
 
@@ -495,8 +496,48 @@ const VkEngine = struct {
         };
         defer allocator.free(queue_create_infos);
 
-        const enabled_extension_names = try desiredDeviceExtensionNames(allocator);
-        defer freeCStringSlice(allocator, enabled_extension_names);
+        const desired_extensions = try desiredDeviceExtensionNames(allocator);
+        defer freeCStringSlice(allocator, desired_extensions);
+
+        const available_extensions = try enumerateDeviceExtensionPropertiesAlloc(allocator, instance_dsp, physical_device);
+        defer allocator.free(available_extensions);
+
+        const available_extension_set: std.StringArrayHashMapUnmanaged(void) = available_extension_set: {
+            var available_extension_set = std.StringArrayHashMap(void).init(allocator);
+            errdefer available_extension_set.deinit();
+
+            try available_extension_set.ensureUnusedCapacity(available_extensions.len);
+            for (available_extensions) |*ext| {
+                available_extension_set.putAssumeCapacityNoClobber(std.meta.assumeSentinel(std.mem.sliceTo(&ext.extension_name, 0), 0), {});
+            }
+
+            break :available_extension_set available_extension_set.unmanaged;
+        };
+        defer {
+            var copy = available_extension_set;
+            copy.deinit(allocator);
+        }
+
+        const selected_extensions: std.ArrayHashMapUnmanaged([*:0]const u8, void, ArrayCStringContext, true) = selected_extensions: {
+            var selected_extensions = std.ArrayHashMap([*:0]const u8, void, ArrayCStringContext, true).init(allocator);
+            errdefer selected_extensions.deinit();
+
+            try selected_extensions.ensureUnusedCapacity(desired_extensions.len);
+            for (desired_extensions) |p_desired_extension| {
+                const desired_extension = std.mem.span(p_desired_extension);
+                if (available_extension_set.contains(desired_extension)) {
+                    selected_extensions.putAssumeCapacityNoClobber(desired_extension, {});
+                } else {
+                    std.log.warn("Desired device extension '{s}' not available.", .{desired_extension});
+                }
+            }
+
+            break :selected_extensions selected_extensions.unmanaged;
+        };
+        defer {
+            var copy = selected_extensions;
+            copy.deinit(allocator);
+        }
 
         const handle = try instance_dsp.createDevice(physical_device, &vk.DeviceCreateInfo{
             .flags = .{},
@@ -507,8 +548,8 @@ const VkEngine = struct {
             .enabled_layer_count = 0,
             .pp_enabled_layer_names = std.mem.span(&[_][*:0]const u8{}).ptr,
 
-            .enabled_extension_count = @intCast(u32, enabled_extension_names.len),
-            .pp_enabled_extension_names = enabled_extension_names.ptr,
+            .enabled_extension_count = @intCast(u32, selected_extensions.count()),
+            .pp_enabled_extension_names = selected_extensions.keys().ptr,
 
             .p_enabled_features = null,
         }, &allocatorVulkanWrapper(&allocator));
