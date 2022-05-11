@@ -45,15 +45,21 @@ fn getInstanceProcAddress(handle: vk.Instance, name: [*:0]const u8) ?*const anyo
 
 const file_logger = @import("file_logger.zig");
 pub const log = file_logger.log;
+pub const log_level: std.log.Level = @field(std.log.Level, @tagName(build_options.log_level));
 
 pub fn main() !void {
     try file_logger.init("vulkan-spincube.log", .{ .stderr_level = .err }, &.{.gpa});
     defer file_logger.deinit();
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{ .verbose_log = false, .stack_trace_frames = 32 }){};
-    defer _ = gpa.deinit();
+    var gpa = if (builtin.mode == .Debug) std.heap.GeneralPurposeAllocator(.{ .verbose_log = true }){};
+    defer if (builtin.mode == .Debug) {
+        _ = gpa.deinit();
+    };
 
-    const allocator: std.mem.Allocator = gpa.allocator();
+    var arena = std.heap.ArenaAllocator.init(if (builtin.mode == .Debug) gpa.allocator() else std.heap.page_allocator);
+    defer arena.deinit();
+
+    const allocator: std.mem.Allocator = arena.allocator();
 
     try glfw.init(.{});
     defer glfw.terminate();
@@ -332,7 +338,7 @@ const VkEngine = struct {
         _ = message_types;
         _ = p_user_data;
 
-        const logger = std.log.scoped(.vulkan_debug_messenger);
+        const logger = std.log.scoped(.vk_messenger);
         const msg_severity = @bitCast(vk.DebugUtilsMessageSeverityFlagsEXT, msg_severity_int);
         const level: std.log.Level = if (msg_severity.error_bit_ext)
             .err
@@ -426,31 +432,35 @@ const VkEngine = struct {
         physical_device: vk.PhysicalDevice,
         queue_family_indices: QueueFamilyIndices,
     ) !VkDevice {
-        var queue_create_infos = std.ArrayList(vk.DeviceQueueCreateInfo).init(allocator);
-        defer queue_create_infos.deinit();
+        const queue_create_infos: []const vk.DeviceQueueCreateInfo = queue_create_infos: {
+            var queue_create_infos = std.ArrayList(vk.DeviceQueueCreateInfo).init(allocator);
+            errdefer queue_create_infos.deinit();
 
-        try queue_create_infos.append(.{
-            .flags = .{},
-            .queue_family_index = queue_family_indices.graphics,
-            .queue_count = 1,
-            .p_queue_priorities = std.mem.span(&[_]f32{1.0}).ptr,
-        });
-        if (queue_family_indices.graphics != queue_family_indices.present) {
             try queue_create_infos.append(.{
                 .flags = .{},
-                .queue_family_index = queue_family_indices.present,
+                .queue_family_index = queue_family_indices.graphics,
                 .queue_count = 1,
                 .p_queue_priorities = std.mem.span(&[_]f32{1.0}).ptr,
             });
-        }
+            if (queue_family_indices.graphics != queue_family_indices.present) {
+                try queue_create_infos.append(.{
+                    .flags = .{},
+                    .queue_family_index = queue_family_indices.present,
+                    .queue_count = 1,
+                    .p_queue_priorities = std.mem.span(&[_]f32{1.0}).ptr,
+                });
+            }
+
+            break :queue_create_infos queue_create_infos.toOwnedSlice();
+        };
+        defer allocator.free(queue_create_infos);
 
         const enabled_extension_names: []const [*:0]const u8 = &.{};
-
         const handle = try instance_dsp.createDevice(physical_device, &vk.DeviceCreateInfo{
             .flags = .{},
 
-            .queue_create_info_count = @intCast(u32, queue_create_infos.items.len),
-            .p_queue_create_infos = queue_create_infos.items.ptr,
+            .queue_create_info_count = @intCast(u32, queue_create_infos.len),
+            .p_queue_create_infos = queue_create_infos.ptr,
 
             .enabled_layer_count = 0,
             .pp_enabled_layer_names = std.mem.span(&[_][*:0]const u8{}).ptr,
@@ -725,6 +735,11 @@ fn allocatorVulkanWrapper(p_allocator: *const std.mem.Allocator) vk.AllocationCa
             alignment: usize,
             allocation_scope: vk.SystemAllocationScope,
         ) callconv(vk.vulkan_call_conv) ?*anyopaque {
+            if (size == 0) {
+                free(p_user_data, p_original);
+                return null;
+            }
+
             const allocator = @ptrCast(*const std.mem.Allocator, @alignCast(@alignOf(std.mem.Allocator), p_user_data)).*;
 
             const old_ptr = (@ptrCast([*]u8, p_original orelse return allocation(p_user_data, size, alignment, allocation_scope)) - @sizeOf(Metadata));
@@ -784,22 +799,6 @@ fn formatApiVersion(
         try writer.print("{d}.", .{variant});
     }
     try writer.print("{d}.{d}.{d}", .{ major, minor, patch });
-}
-
-fn OptionalFields(comptime T: type, comptime null_init: bool) type {
-    const old_fields: []const std.builtin.Type.StructField = @typeInfo(T).Struct.fields;
-    var new_fields = old_fields[0..old_fields.len].*;
-    for (new_fields) |*field| {
-        field.field_type = ?field.field_type;
-        field.default_value = if (null_init) @ptrCast(*const anyopaque, &@as(field.field_type, null)) else null;
-        field.alignment = @alignOf(field.field_type);
-    }
-    return @Type(@unionInit(std.builtin.Type, "Struct", std.builtin.Type.Struct{
-        .layout = .Auto,
-        .fields = &new_fields,
-        .decls = &.{},
-        .is_tuple = false,
-    }));
 }
 
 const ArrayCStringContext = struct {
