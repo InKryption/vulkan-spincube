@@ -284,7 +284,7 @@ const VkEngine = struct {
                     ,
                         .{
                             std.mem.sliceTo(&layer.layer_name, 0),
-                            std.mem.span(&layer.description),
+                            std.mem.sliceTo(&layer.description, 0),
                             fmtApiVersion(layer.implementation_version),
                             fmtApiVersion(layer.spec_version),
                         },
@@ -331,11 +331,14 @@ const VkEngine = struct {
             .p_user_data = null,
         } else void{};
 
-        const handle = try createInstance(allocator, bd, InstanceCreateInfo{
+        const handle = createInstance(allocator, bd, InstanceCreateInfo{
             .p_next = if (build_options.vk_validation_layers) &inst_debug_messenger_creation_info else null,
             .enabled_layer_names = selected_layers.keys(),
             .enabled_extension_names = selected_extensions.keys(),
-        });
+        }) catch |err| return switch (err) {
+            error.LayerNotPresent => unreachable,
+            else => err,
+        };
         const dsp = InstanceDispatch.load(handle, instanceProcLoader) catch |err| {
             const min_dsp = InstanceDispatchMin.load(handle, instanceProcLoader) catch return err;
             min_dsp.destroyInstance(handle, &allocatorVulkanWrapper(&allocator));
@@ -350,8 +353,12 @@ const VkEngine = struct {
     }
 
     fn desiredInstanceLayerNames(allocator: std.mem.Allocator) ![]const [*:0]const u8 {
+        comptime if (builtin.mode != .Debug) return &.{};
+
         var result = std.ArrayList([*:0]const u8).init(allocator);
         errdefer freeCStringSlice(allocator, result.toOwnedSlice());
+
+        try result.append(try allocator.dupeZ(u8, "VK_LAYER_KHRONOS_validation"));
 
         return result.toOwnedSlice();
     }
