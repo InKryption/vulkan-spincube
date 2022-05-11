@@ -48,10 +48,33 @@ pub fn main() !void {
 
     const allocator: std.mem.Allocator = gpa.allocator();
 
+    const Args = struct {
+        enable_debug_messenger: bool,
+    };
+    const args: Args = args: {
+        var args = OptionalFields(Args, true){};
+
+        var args_iter = try std.process.argsWithAllocator(allocator);
+        defer args_iter.deinit();
+
+        while (args_iter.next()) |tok| {
+            if (std.mem.eql(u8, "--enable-debug-messenger", tok)) {
+                args.enable_debug_messenger = true;
+                continue;
+            }
+        }
+
+        break :args Args{
+            .enable_debug_messenger = args.enable_debug_messenger orelse build_options.vk_validation_layers,
+        };
+    };
+
     try glfw.init(.{});
     defer glfw.terminate();
 
-    const engine = try VkEngine.init(allocator, getInstanceProcAddress);
+    const engine = try VkEngine.init(allocator, getInstanceProcAddress, .{
+        .enable_debug_messenger = args.enable_debug_messenger,
+    });
     defer engine.deinit(allocator);
 }
 
@@ -61,12 +84,26 @@ const VkEngine = struct {
 
     const VkInst = struct { handle: vk.Instance, dsp: InstanceDispatch };
 
-    pub fn init(allocator: std.mem.Allocator, instanceProcLoader: anytype) !VkEngine {
+    const InitConfig = struct {
+        enable_debug_messenger: bool = build_options.vk_validation_layers,
+    };
+    pub fn init(
+        allocator: std.mem.Allocator,
+        instanceProcLoader: anytype,
+        config: InitConfig,
+    ) !VkEngine {
         const inst: VkInst = try initVkInst(allocator, instanceProcLoader);
         errdefer inst.dsp.destroyInstance(inst.handle, &allocatorVulkanWrapper(&allocator));
 
-        const debug_messenger = if (build_options.vk_validation_layers) try createVkDebugMessenger(allocator, inst) else {};
-        errdefer if (build_options.vk_validation_layers) destroyVkDebugMessenger(allocator, inst, debug_messenger);
+        const debug_messenger = if (build_options.vk_validation_layers)
+            if (config.enable_debug_messenger)
+                try createVkDebugMessenger(allocator, inst)
+            else
+                .null_handle
+        else {};
+        errdefer if (build_options.vk_validation_layers and config.enable_debug_messenger) {
+            destroyVkDebugMessenger(allocator, inst, debug_messenger);
+        };
 
         return VkEngine{
             .inst = inst,
@@ -548,6 +585,22 @@ fn formatApiVersion(
         try writer.print("{d}.", .{variant});
     }
     try writer.print("{d}.{d}.{d}", .{ major, minor, patch });
+}
+
+fn OptionalFields(comptime T: type, comptime null_init: bool) type {
+    const old_fields: []const std.builtin.Type.StructField = @typeInfo(T).Struct.fields;
+    var new_fields = old_fields[0..old_fields.len].*;
+    for (new_fields) |*field| {
+        field.field_type = ?field.field_type;
+        field.default_value = if (null_init) @ptrCast(*const anyopaque, &@as(field.field_type, null)) else null;
+        field.alignment = @alignOf(field.field_type);
+    }
+    return @Type(@unionInit(std.builtin.Type, "Struct", std.builtin.Type.Struct{
+        .layout = .Auto,
+        .fields = &new_fields,
+        .decls = &.{},
+        .is_tuple = false,
+    }));
 }
 
 const ArrayCStringContext = struct {
