@@ -23,10 +23,10 @@ const InstanceDispatch = vk.InstanceWrapper(vk.InstanceCommandFlags{
     .getPhysicalDeviceFeatures = true,
     .getPhysicalDeviceFormatProperties = true,
     .getPhysicalDeviceImageFormatProperties = true,
-
-    .createDevice = true,
     .getPhysicalDeviceSurfaceSupportKHR = true,
     .destroySurfaceKHR = true,
+
+    .createDevice = true,
 
     .createDebugUtilsMessengerEXT = build_options.vk_validation_layers,
     .destroyDebugUtilsMessengerEXT = build_options.vk_validation_layers,
@@ -34,6 +34,7 @@ const InstanceDispatch = vk.InstanceWrapper(vk.InstanceCommandFlags{
 const DeviceDispatchMin = vk.DeviceWrapper(vk.DeviceCommandFlags{ .destroyDevice = true });
 const DeviceDispatch = vk.DeviceWrapper(vk.DeviceCommandFlags{
     .destroyDevice = true,
+    .getDeviceQueue = true,
 });
 
 fn getInstanceProcAddress(handle: vk.Instance, name: [*:0]const u8) ?*const anyopaque {
@@ -62,6 +63,9 @@ pub fn main() !void {
 
     const engine = try VkEngine.init(allocator, getInstanceProcAddress, window);
     defer engine.deinit(allocator);
+
+    _ = engine.getCoreDeviceQueue(.present, 0);
+    _ = engine.getCoreDeviceQueue(.graphics, 0);
 
     while (!window.shouldClose()) {
         try glfw.pollEvents();
@@ -422,23 +426,31 @@ const VkEngine = struct {
         physical_device: vk.PhysicalDevice,
         queue_family_indices: QueueFamilyIndices,
     ) !VkDevice {
-        const queue_create_infos = [_]vk.DeviceQueueCreateInfo{
-            .{
+        var queue_create_infos = std.ArrayList(vk.DeviceQueueCreateInfo).init(allocator);
+        defer queue_create_infos.deinit();
+
+        try queue_create_infos.append(.{
+            .flags = .{},
+            .queue_family_index = queue_family_indices.graphics,
+            .queue_count = 1,
+            .p_queue_priorities = std.mem.span(&[_]f32{1.0}).ptr,
+        });
+        if (queue_family_indices.graphics != queue_family_indices.present) {
+            try queue_create_infos.append(.{
                 .flags = .{},
-                .queue_family_index = queue_family_indices.graphics,
+                .queue_family_index = queue_family_indices.present,
                 .queue_count = 1,
                 .p_queue_priorities = std.mem.span(&[_]f32{1.0}).ptr,
-            },
-        };
-        _ = queue_create_infos;
+            });
+        }
 
         const enabled_extension_names: []const [*:0]const u8 = &.{};
 
-        const create_info = vk.DeviceCreateInfo{
+        const handle = try instance_dsp.createDevice(physical_device, &vk.DeviceCreateInfo{
             .flags = .{},
 
-            .queue_create_info_count = @intCast(u32, queue_create_infos.len),
-            .p_queue_create_infos = &queue_create_infos,
+            .queue_create_info_count = @intCast(u32, queue_create_infos.items.len),
+            .p_queue_create_infos = queue_create_infos.items.ptr,
 
             .enabled_layer_count = 0,
             .pp_enabled_layer_names = std.mem.span(&[_][*:0]const u8{}).ptr,
@@ -447,9 +459,7 @@ const VkEngine = struct {
             .pp_enabled_extension_names = enabled_extension_names.ptr,
 
             .p_enabled_features = null,
-        };
-
-        const handle = try instance_dsp.createDevice(physical_device, &create_info, &allocatorVulkanWrapper(&allocator));
+        }, &allocatorVulkanWrapper(&allocator));
         const dsp = DeviceDispatch.load(handle, instance_dsp.dispatch.vkGetDeviceProcAddr) catch |err| {
             const min_dsp = DeviceDispatchMin.load(handle, instance_dsp.dispatch.vkGetDeviceProcAddr) catch {
                 std.log.err("Failed to load function to destroy device, cleanup not possible.", .{});
