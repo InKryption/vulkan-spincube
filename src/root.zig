@@ -40,7 +40,7 @@ const file_logger = @import("file_logger.zig");
 pub const log = file_logger.log;
 
 pub fn main() !void {
-    try file_logger.init("vulkan-spincube.log", .{ .stderr_level = .err }, &.{ .gpa });
+    try file_logger.init("vulkan-spincube.log", .{ .stderr_level = .err }, &.{.gpa});
     defer file_logger.deinit();
 
     var gpa = std.heap.GeneralPurposeAllocator(.{ .verbose_log = false, .stack_trace_frames = 32 }){};
@@ -59,8 +59,14 @@ const VkEngine = struct {
     inst: VkInst,
     debug_messenger: if (build_options.vk_validation_layers) vk.DebugUtilsMessengerEXT else void,
     physical_device: vk.PhysicalDevice,
+    queue_family_indices: QueueFamilyIndices,
 
     const VkInst = struct { handle: vk.Instance, dsp: InstanceDispatch };
+
+    const QueueFamilyId = std.meta.FieldEnum(QueueFamilyIndices);
+    const QueueFamilyIndices = struct {
+        graphics: u32,
+    };
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -77,11 +83,13 @@ const VkEngine = struct {
         };
 
         const physical_device: vk.PhysicalDevice = try selectPhysicalDevice(allocator, inst);
+        const queue_family_indices: QueueFamilyIndices = try selectQueueFamilyIndices(allocator, inst.dsp, physical_device);
 
         return VkEngine{
             .inst = inst,
             .debug_messenger = debug_messenger,
             .physical_device = physical_device,
+            .queue_family_indices = queue_family_indices,
         };
     }
     pub fn deinit(self: VkEngine, allocator: std.mem.Allocator) void {
@@ -91,6 +99,35 @@ const VkEngine = struct {
         self.inst.dsp.destroyInstance(self.inst.handle, &allocatorVulkanWrapper(&allocator));
     }
 
+    fn selectQueueFamilyIndices(allocator: std.mem.Allocator, dsp: InstanceDispatch, physical_device: vk.PhysicalDevice) !QueueFamilyIndices {
+        var indices = std.EnumArray(QueueFamilyId, ?u32).initFill(null);
+
+        const qfam_properties: []const vk.QueueFamilyProperties = try getPhysicalDeviceQueueFamilyPropertiesAlloc(allocator, dsp, physical_device);
+        defer allocator.free(qfam_properties);
+
+        for (qfam_properties) |qfam, index| {
+            if (qfam.queue_flags.graphics_bit) {
+                indices.set(.graphics, @intCast(u32, index));
+            }
+        }
+
+        log_qfamily_indices: {
+            std.log.debug("Selected following queue family indices:", .{});
+            var iterator = indices.iterator();
+            while (iterator.next()) |entry| {
+                std.log.debug("  {s}: {}", .{ @tagName(entry.key), entry.value.* });
+            }
+            break :log_qfamily_indices;
+        }
+
+        var result: QueueFamilyIndices = undefined;
+        inline for (comptime std.enums.values(QueueFamilyId)) |tag| {
+            const tag_name = @tagName(tag);
+            const title_case = [_]u8{std.ascii.toUpper(tag_name[0])} ++ tag_name[@boolToInt(tag_name.len >= 1)..];
+            @field(result, @tagName(tag)) = indices.get(tag) orelse return @field(anyerror, "MissingFamilyQueueIndexFor" ++ title_case);
+        }
+        return result;
+    }
     fn selectPhysicalDevice(allocator: std.mem.Allocator, inst: VkInst) !vk.PhysicalDevice {
         const physical_devices = try enumeratePhysicalDevicesAlloc(allocator, inst.handle, inst.dsp);
         defer allocator.free(physical_devices);
@@ -346,6 +383,22 @@ const VkEngine = struct {
         allocator.free(extension_names);
     }
 
+    pub fn getPhysicalDeviceQueueFamilyPropertiesAlloc(
+        allocator: std.mem.Allocator,
+        dsp: InstanceDispatch,
+        physical_device: vk.PhysicalDevice,
+    ) ![]vk.QueueFamilyProperties {
+        var count: u32 = undefined;
+
+        dsp.getPhysicalDeviceQueueFamilyProperties(physical_device, &count, null);
+        const properties = try allocator.alloc(vk.QueueFamilyProperties, count);
+        errdefer allocator.free(properties);
+
+        dsp.getPhysicalDeviceQueueFamilyProperties(physical_device, &count, properties.ptr);
+        std.debug.assert(properties.len == count);
+
+        return properties;
+    }
     pub fn enumeratePhysicalDevicesAlloc(allocator: std.mem.Allocator, instance: vk.Instance, dsp: InstanceDispatch) ![]vk.PhysicalDevice {
         var count: u32 = undefined;
         if (dsp.enumeratePhysicalDevices(instance, &count, null)) |result| switch (result) {
