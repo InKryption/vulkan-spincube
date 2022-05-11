@@ -5,13 +5,32 @@ var log_file_writer_mutex: std.Thread.Mutex = .{};
 var log_file_writer: std.io.BufferedWriter(1024 * 8, std.fs.File.Writer) = undefined;
 
 const Config = struct {
-    stderr_level: ?std.log.Level = null,
-    final_flush_retries: u16 = 100,
+    stderr_level: ?std.log.Level,
+    final_flush_retries: u16,
+    stderr_excluded_scopes: []const []const u8,
 };
 var config: Config = undefined;
 
-pub fn init(rel_outpath: []const u8, cfg: Config) !void {
-    config = cfg;
+pub const InitConfig = struct {
+    stderr_level: ?std.log.Level = null,
+    final_flush_retries: u16 = 100,
+};
+pub fn init(
+    rel_outpath: []const u8,
+    cfg: InitConfig,
+    comptime stderr_excluded_scopes: []const @Type(.EnumLiteral),
+) !void {
+    config = .{
+        .stderr_level = cfg.stderr_level,
+        .final_flush_retries = cfg.final_flush_retries,
+        .stderr_excluded_scopes = comptime blk: {
+            var names: []const []const u8 = &.{};
+            for (stderr_excluded_scopes) |tag| {
+                names = names ++ &[_][]const u8{@tagName(tag)};
+            }
+            break :blk names;
+        },
+    };
     log_file_writer = .{
         .unbuffered_writer = .{
             .context = try std.fs.cwd().createFile(rel_outpath, .{}),
@@ -43,15 +62,18 @@ pub fn log(
         writer.print("({s}): ", .{@tagName(scope)}) catch return;
     } else writer.writeAll(": ") catch return;
 
-    if (scope == .default) {
+    if (std.sort.binarySearch([]const u8, @tagName(scope), config.stderr_excluded_scopes, void{}, struct {
+        fn compare(ctx: void, lhs: []const u8, rhs: []const u8) std.math.Order {
+            ctx;
+            return std.mem.order(u8, lhs, rhs);
+        }
+    }.compare) == null) {
         if (config.stderr_level) |stderr_level| {
-            switch (stderr_level) {
-                .err => if (message_level == .err) std.log.defaultLog(message_level, scope, format, args),
-                .warn => if (@enumToInt(message_level) <= @enumToInt(std.log.Level.warn)) std.log.defaultLog(message_level, scope, format, args),
-                .info => if (@enumToInt(message_level) <= @enumToInt(std.log.Level.info)) std.log.defaultLog(message_level, scope, format, args),
-                .debug => if (@enumToInt(message_level) <= @enumToInt(std.log.Level.debug)) std.log.defaultLog(message_level, scope, format, args),
+            if (@enumToInt(message_level) <= @enumToInt(stderr_level)) {
+                std.log.defaultLog(message_level, scope, format, args);
             }
         }
     }
+
     writer.print(format ++ "\n", args) catch return;
 }

@@ -40,7 +40,7 @@ const file_logger = @import("file_logger.zig");
 pub const log = file_logger.log;
 
 pub fn main() !void {
-    try file_logger.init("vulkan-spincube.log", .{ .stderr_level = .err });
+    try file_logger.init("vulkan-spincube.log", .{ .stderr_level = .err }, &.{ .gpa });
     defer file_logger.deinit();
 
     var gpa = std.heap.GeneralPurposeAllocator(.{ .verbose_log = false, .stack_trace_frames = 32 }){};
