@@ -4,7 +4,13 @@ const std = @import("std");
 var log_file_writer_mutex: std.Thread.Mutex = .{};
 var log_file_writer: std.io.BufferedWriter(1024 * 8, std.fs.File.Writer) = undefined;
 
-pub fn init(rel_outpath: []const u8) !void {
+const Config = struct {
+    stderr_level: ?std.log.Level = null,
+};
+var config: Config = undefined;
+
+pub fn init(rel_outpath: []const u8, cfg: Config) !void {
+    config = cfg;
     log_file_writer = .{
         .unbuffered_writer = .{
             .context = try std.fs.cwd().createFile(rel_outpath, .{}),
@@ -33,5 +39,13 @@ pub fn log(
         writer.print("({s}): ", .{@tagName(scope)}) catch return;
     } else writer.writeAll(": ") catch return;
 
+    if (config.stderr_level) |stderr_level| {
+        switch (stderr_level) {
+            .err => if (message_level == .err) std.log.defaultLog(message_level, scope, format, args),
+            .warn => if (@enumToInt(message_level) <= @enumToInt(std.log.Level.warn)) std.log.defaultLog(message_level, scope, format, args),
+            .info => if (@enumToInt(message_level) <= @enumToInt(std.log.Level.info)) std.log.defaultLog(message_level, scope, format, args),
+            .debug => if (@enumToInt(message_level) <= @enumToInt(std.log.Level.debug)) std.log.defaultLog(message_level, scope, format, args),
+        }
+    }
     writer.print(format ++ "\n", args) catch return;
 }

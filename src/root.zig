@@ -40,7 +40,7 @@ const file_logger = @import("file_logger.zig");
 pub const log = file_logger.log;
 
 pub fn main() !void {
-    try file_logger.init("vulkan-spincube.log");
+    try file_logger.init("vulkan-spincube.log", .{ .stderr_level = .err });
     defer file_logger.deinit();
 
     var gpa = std.heap.GeneralPurposeAllocator(.{ .verbose_log = false }){};
@@ -57,17 +57,49 @@ pub fn main() !void {
         var args_iter = try std.process.argsWithAllocator(allocator);
         defer args_iter.deinit();
 
+        std.debug.assert(args_iter.skip());
         while (args_iter.next()) |tok| {
-            if (std.mem.eql(u8, "--enable-debug-messenger", tok)) {
-                args.enable_debug_messenger = true;
-                continue;
+            if (std.mem.startsWith(u8, tok, "--enable-debug-messenger")) {
+                const start = "--enable-debug-messenger".len;
+                if (std.mem.eql(u8, tok[start..], "")) {
+                    args.enable_debug_messenger = true;
+                    continue;
+                }
+                if (std.mem.eql(u8, tok[start..], "=true")) {
+                    args.enable_debug_messenger = true;
+                    continue;
+                }
+                if (std.mem.eql(u8, tok[start..], "=false")) {
+                    args.enable_debug_messenger = false;
+                    continue;
+                }
+                if (std.mem.eql(u8, tok[start..], "=")) {
+                    const val_tok = args_iter.next() orelse return {
+                        std.log.err("Missing Argument value to '{s}'.", .{tok});
+                    };
+                    if (std.mem.eql(u8, val_tok, "true")) {
+                        args.enable_debug_messenger = true;
+                        continue;
+                    }
+                    if (std.mem.eql(u8, val_tok, "false")) {
+                        args.enable_debug_messenger = false;
+                        continue;
+                    }
+                    std.log.err("Invalid Argument value '{s}' to '{s}'.", .{ val_tok, tok });
+                    return;
+                }
+                std.log.err("Invalid Argument value to '{s}'.", .{tok});
+                return;
             }
+            std.log.err("Unrecognized Argument '{s}'.", .{tok});
+            return;
         }
 
         break :args Args{
             .enable_debug_messenger = args.enable_debug_messenger orelse build_options.vk_validation_layers,
         };
     };
+    std.log.info("{}", .{args});
 
     try glfw.init(.{});
     defer glfw.terminate();
@@ -216,7 +248,7 @@ const VkEngine = struct {
             break :available_extension_set available_extension_set.unmanaged;
         };
         const selected_extensions: std.ArrayHashMapUnmanaged([*:0]const u8, void, ArrayCStringContext, true) = selected_extensions: {
-            var selected_extensions = std.ArrayHashMap([*:0]const u8, void, ArrayCStringContext, true).init(allocator);
+            var selected_extensions = std.ArrayHashMap([*:0]const u8, void, ArrayCStringContext, true).init(local_arena);
             errdefer selected_extensions.deinit();
 
             try selected_extensions.ensureUnusedCapacity(desired_extensions.len);
@@ -232,7 +264,7 @@ const VkEngine = struct {
             break :selected_extensions selected_extensions.unmanaged;
         };
 
-        {
+        log_layers_and_extensions: {
             var log_buff = std.ArrayList(u8).init(local_arena);
             defer log_buff.deinit();
             const log_buff_writer = log_buff.writer();
@@ -278,6 +310,8 @@ const VkEngine = struct {
                 }
                 std.log.debug("{s}", .{log_buff.items});
             }
+
+            break :log_layers_and_extensions;
         }
 
         const inst_debug_messenger_creation_info = if (build_options.vk_validation_layers) vk.DebugUtilsMessengerCreateInfoEXT{
