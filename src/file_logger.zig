@@ -39,12 +39,14 @@ pub fn log(
         writer.print("({s}): ", .{@tagName(scope)}) catch return;
     } else writer.writeAll(": ") catch return;
 
-    if (config.stderr_level) |stderr_level| {
-        switch (stderr_level) {
-            .err => if (message_level == .err) std.log.defaultLog(message_level, scope, format, args),
-            .warn => if (@enumToInt(message_level) <= @enumToInt(std.log.Level.warn)) std.log.defaultLog(message_level, scope, format, args),
-            .info => if (@enumToInt(message_level) <= @enumToInt(std.log.Level.info)) std.log.defaultLog(message_level, scope, format, args),
-            .debug => if (@enumToInt(message_level) <= @enumToInt(std.log.Level.debug)) std.log.defaultLog(message_level, scope, format, args),
+    if (scope == .default) {
+        if (config.stderr_level) |stderr_level| {
+            switch (stderr_level) {
+                .err => if (message_level == .err) std.log.defaultLog(message_level, scope, format, args),
+                .warn => if (@enumToInt(message_level) <= @enumToInt(std.log.Level.warn)) std.log.defaultLog(message_level, scope, format, args),
+                .info => if (@enumToInt(message_level) <= @enumToInt(std.log.Level.info)) std.log.defaultLog(message_level, scope, format, args),
+                .debug => if (@enumToInt(message_level) <= @enumToInt(std.log.Level.debug)) std.log.defaultLog(message_level, scope, format, args),
+            }
         }
     }
     writer.print(format ++ "\n", args) catch return;

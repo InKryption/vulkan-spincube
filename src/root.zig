@@ -43,7 +43,7 @@ pub fn main() !void {
     try file_logger.init("vulkan-spincube.log", .{ .stderr_level = .err });
     defer file_logger.deinit();
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{ .verbose_log = false }){};
+    var gpa = std.heap.GeneralPurposeAllocator(.{ .verbose_log = false, .stack_trace_frames = 32 }){};
     defer _ = gpa.deinit();
 
     const allocator: std.mem.Allocator = gpa.allocator();
@@ -58,6 +58,7 @@ pub fn main() !void {
 const VkEngine = struct {
     inst: VkInst,
     debug_messenger: if (build_options.vk_validation_layers) vk.DebugUtilsMessengerEXT else void,
+    physical_device: vk.PhysicalDevice,
 
     const VkInst = struct { handle: vk.Instance, dsp: InstanceDispatch };
 
@@ -71,13 +72,16 @@ const VkEngine = struct {
         const debug_messenger = if (build_options.vk_validation_layers)
             try createVkDebugMessenger(allocator, inst)
         else {};
-        errdefer if (build_options.vk_validation_layers and config.enable_debug_messenger) {
+        errdefer if (build_options.vk_validation_layers) {
             destroyVkDebugMessenger(allocator, inst, debug_messenger);
         };
+
+        const physical_device: vk.PhysicalDevice = try selectPhysicalDevice(allocator, inst);
 
         return VkEngine{
             .inst = inst,
             .debug_messenger = debug_messenger,
+            .physical_device = physical_device,
         };
     }
     pub fn deinit(self: VkEngine, allocator: std.mem.Allocator) void {
@@ -85,6 +89,23 @@ const VkEngine = struct {
             self.inst.dsp.destroyDebugUtilsMessengerEXT(self.inst.handle, self.debug_messenger, &allocatorVulkanWrapper(&allocator));
         }
         self.inst.dsp.destroyInstance(self.inst.handle, &allocatorVulkanWrapper(&allocator));
+    }
+
+    fn selectPhysicalDevice(allocator: std.mem.Allocator, inst: VkInst) !vk.PhysicalDevice {
+        const physical_devices = try enumeratePhysicalDevicesAlloc(allocator, inst.handle, inst.dsp);
+        defer allocator.free(physical_devices);
+
+        switch (physical_devices.len) {
+            0 => return error.NoPhysicalDevicesAvailable,
+            1 => return physical_devices[0],
+            2 => {
+                std.log.warn("TODO: Two physical devices available; no selection process implemented, defaulting to physical_devices[0].", .{});
+            },
+            else => {
+                std.log.warn("TODO: {d} physical devices available; no selection process implemented, defaulting to physical_devices[0].", .{physical_devices.len});
+            },
+        }
+        return physical_devices[0];
     }
 
     fn createVkDebugMessenger(allocator: std.mem.Allocator, inst: VkInst) !vk.DebugUtilsMessengerEXT {
@@ -325,6 +346,24 @@ const VkEngine = struct {
         allocator.free(extension_names);
     }
 
+    pub fn enumeratePhysicalDevicesAlloc(allocator: std.mem.Allocator, instance: vk.Instance, dsp: InstanceDispatch) ![]vk.PhysicalDevice {
+        var count: u32 = undefined;
+        if (dsp.enumeratePhysicalDevices(instance, &count, null)) |result| switch (result) {
+            .success => {},
+            else => unreachable,
+        } else |err| return err;
+
+        const physical_devices = try allocator.alloc(vk.PhysicalDevice, count);
+        errdefer allocator.free(physical_devices);
+
+        if (dsp.enumeratePhysicalDevices(instance, &count, physical_devices.ptr)) |result| switch (result) {
+            .success => {},
+            else => unreachable,
+        } else |err| return err;
+
+        std.debug.assert(physical_devices.len == count);
+        return physical_devices;
+    }
     pub const InstanceCreateInfo = struct {
         p_next: ?*const anyopaque = null,
 
