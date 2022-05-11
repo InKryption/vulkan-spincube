@@ -25,6 +25,8 @@ const InstanceDispatch = vk.InstanceWrapper(vk.InstanceCommandFlags{
     .getPhysicalDeviceImageFormatProperties = true,
 
     .createDevice = true,
+    .getPhysicalDeviceSurfaceSupportKHR = true,
+    .destroySurfaceKHR = true,
 
     .createDebugUtilsMessengerEXT = build_options.vk_validation_layers,
     .destroyDebugUtilsMessengerEXT = build_options.vk_validation_layers,
@@ -55,8 +57,15 @@ pub fn main() !void {
     try glfw.init(.{});
     defer glfw.terminate();
 
-    const engine = try VkEngine.init(allocator, getInstanceProcAddress);
+    const window = try glfw.Window.create(100, 100, "vulkan-spincube", null, null, glfw.Window.Hints{ .client_api = .no_api });
+    defer window.destroy();
+
+    const engine = try VkEngine.init(allocator, getInstanceProcAddress, window);
     defer engine.deinit(allocator);
+
+    while (!window.shouldClose()) {
+        try glfw.pollEvents();
+    }
 }
 
 const VkEngine = struct {
@@ -65,6 +74,7 @@ const VkEngine = struct {
     physical_device: vk.PhysicalDevice,
     queue_family_indices: QueueFamilyIndices,
     device: VkDevice,
+    surface_khr: vk.SurfaceKHR,
 
     const VkInst = struct { handle: vk.Instance, dsp: InstanceDispatch };
     const VkDevice = struct { handle: vk.Device, dsp: DeviceDispatch };
@@ -72,11 +82,13 @@ const VkEngine = struct {
     const QueueFamilyId = std.meta.FieldEnum(QueueFamilyIndices);
     const QueueFamilyIndices = struct {
         graphics: u32,
+        present: u32,
     };
 
     pub fn init(
         allocator: std.mem.Allocator,
         instanceProcLoader: anytype,
+        window: glfw.Window,
     ) !VkEngine {
         const inst: VkInst = try initVkInst(allocator, instanceProcLoader);
         errdefer inst.dsp.destroyInstance(inst.handle, &allocatorVulkanWrapper(&allocator));
@@ -89,7 +101,20 @@ const VkEngine = struct {
         };
 
         const physical_device: vk.PhysicalDevice = try selectPhysicalDevice(allocator, inst);
-        const queue_family_indices: QueueFamilyIndices = try selectQueueFamilyIndices(allocator, inst.dsp, physical_device);
+
+        const surface_khr: vk.SurfaceKHR = surface_khr: {
+            var surface_khr: vk.SurfaceKHR = undefined;
+            if (glfw.createWindowSurface(inst.handle, window, @as(?*const vk.AllocationCallbacks, &allocatorVulkanWrapper(&allocator)), &surface_khr)) |result| {
+                switch (@intToEnum(vk.Result, result)) {
+                    .success => {},
+                    else => std.log.warn("glfw.createWindowSurface: '{s}'.\n", .{@tagName(@intToEnum(vk.Result, result))}),
+                }
+            } else |err| return err;
+            break :surface_khr surface_khr;
+        };
+        errdefer inst.dsp.destroySurfaceKHR(inst.handle, surface_khr, &allocatorVulkanWrapper(&allocator));
+
+        const queue_family_indices: QueueFamilyIndices = try selectQueueFamilyIndices(allocator, inst.dsp, physical_device, surface_khr);
 
         const device = try initVkDevice(allocator, inst.dsp, physical_device, queue_family_indices);
         errdefer device.dsp.destroyDevice(device.handle, &allocatorVulkanWrapper(&allocator));
@@ -100,10 +125,12 @@ const VkEngine = struct {
             .physical_device = physical_device,
             .queue_family_indices = queue_family_indices,
             .device = device,
+            .surface_khr = surface_khr,
         };
     }
     pub fn deinit(self: VkEngine, allocator: std.mem.Allocator) void {
         self.device.dsp.destroyDevice(self.device.handle, &allocatorVulkanWrapper(&allocator));
+        self.inst.dsp.destroySurfaceKHR(self.inst.handle, self.surface_khr, &allocatorVulkanWrapper(&allocator));
         if (build_options.vk_validation_layers) {
             self.inst.dsp.destroyDebugUtilsMessengerEXT(self.inst.handle, self.debug_messenger, &allocatorVulkanWrapper(&allocator));
         }
@@ -336,15 +363,38 @@ const VkEngine = struct {
         }
         return physical_devices[0];
     }
-    fn selectQueueFamilyIndices(allocator: std.mem.Allocator, dsp: InstanceDispatch, physical_device: vk.PhysicalDevice) !QueueFamilyIndices {
+    fn selectQueueFamilyIndices(
+        allocator: std.mem.Allocator,
+        dsp: InstanceDispatch,
+        physical_device: vk.PhysicalDevice,
+        surface_khr: vk.SurfaceKHR,
+    ) !QueueFamilyIndices {
         var indices = std.EnumArray(QueueFamilyId, ?u32).initFill(null);
 
         const qfam_properties: []const vk.QueueFamilyProperties = try getPhysicalDeviceQueueFamilyPropertiesAlloc(allocator, dsp, physical_device);
         defer allocator.free(qfam_properties);
 
-        for (qfam_properties) |qfam, index| {
+        for (qfam_properties) |qfam, i| {
+            const index = @intCast(u32, i);
+            const surface_support = (try dsp.getPhysicalDeviceSurfaceSupportKHR(physical_device, index, surface_khr)) == vk.TRUE;
+            if (qfam.queue_flags.graphics_bit and surface_support) {
+                indices.set(.graphics, index);
+                indices.set(.present, index);
+                break;
+            }
             if (qfam.queue_flags.graphics_bit) {
-                indices.set(.graphics, @intCast(u32, index));
+                if (indices.get(.graphics)) |prev_index| {
+                    if (qfam_properties[prev_index].queue_count < qfam.queue_count) {
+                        indices.set(.graphics, index);
+                    }
+                }
+            }
+            if (surface_support) {
+                if (indices.get(.present)) |prev_index| {
+                    if (qfam_properties[prev_index].queue_count < qfam.queue_count) {
+                        indices.set(.present, index);
+                    }
+                }
             }
         }
 
