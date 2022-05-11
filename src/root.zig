@@ -28,6 +28,9 @@ const InstanceDispatch = vk.InstanceWrapper(vk.InstanceCommandFlags{
 
     .createDevice = true,
     .enumerateDeviceExtensionProperties = true,
+    .getPhysicalDeviceSurfaceCapabilitiesKHR = true,
+    .getPhysicalDeviceSurfaceFormatsKHR = true,
+    .getPhysicalDeviceSurfacePresentModesKHR = true,
 
     .createDebugUtilsMessengerEXT = build_options.vk_validation_layers,
     .destroyDebugUtilsMessengerEXT = build_options.vk_validation_layers,
@@ -86,6 +89,7 @@ const VkEngine = struct {
     queue_family_indices: QueueFamilyIndices,
     device: VkDevice,
     surface_khr: vk.SurfaceKHR,
+    swapchain_details: SwapchainDetails,
 
     const VkInst = struct { handle: vk.Instance, dsp: InstanceDispatch };
     const VkDevice = struct { handle: vk.Device, dsp: DeviceDispatch };
@@ -94,6 +98,12 @@ const VkEngine = struct {
     const QueueFamilyIndices = struct {
         graphics: u32,
         present: u32,
+    };
+
+    const SwapchainDetails = struct {
+        capabilities: vk.SurfaceCapabilitiesKHR,
+        format: vk.SurfaceFormatKHR,
+        present_mode: vk.PresentModeKHR,
     };
 
     pub fn init(
@@ -125,6 +135,7 @@ const VkEngine = struct {
         };
         errdefer inst.dsp.destroySurfaceKHR(inst.handle, surface_khr, &allocatorVulkanWrapper(&allocator));
 
+        const swapchain_details = try querySwapchainSupportDetails(allocator, inst.dsp, physical_device, surface_khr);
         const queue_family_indices: QueueFamilyIndices = try selectQueueFamilyIndices(allocator, inst.dsp, physical_device, surface_khr);
 
         const device = try initVkDevice(allocator, inst.dsp, physical_device, queue_family_indices);
@@ -137,6 +148,7 @@ const VkEngine = struct {
             .queue_family_indices = queue_family_indices,
             .device = device,
             .surface_khr = surface_khr,
+            .swapchain_details = swapchain_details,
         };
     }
     pub fn deinit(self: VkEngine, allocator: std.mem.Allocator) void {
@@ -569,6 +581,58 @@ const VkEngine = struct {
         };
     }
 
+    fn querySwapchainSupportDetails(
+        allocator: std.mem.Allocator,
+        instance_dsp: InstanceDispatch,
+        physical_device: vk.PhysicalDevice,
+        surface_khr: vk.SurfaceKHR,
+    ) !SwapchainDetails {
+        const capabilities = try instance_dsp.getPhysicalDeviceSurfaceCapabilitiesKHR(physical_device, surface_khr);
+
+        const selected_format: vk.SurfaceFormatKHR = selected_format: {
+            const formats: []const vk.SurfaceFormatKHR = try getPhysicalDeviceSurfaceFormatsKHRAlloc(
+                allocator,
+                instance_dsp,
+                physical_device,
+                surface_khr,
+            );
+            defer allocator.free(formats);
+
+            if (formats.len == 0) return error.NoSurfaceFormatsAvailable;
+            for (formats) |format| {
+                if (format.format == .b8g8r8a8_srgb and format.color_space == .srgb_nonlinear_khr) {
+                    std.log.debug("Selected surface format: {}", .{format});
+                    break :selected_format format;
+                }
+            }
+
+            break :selected_format formats[0];
+        };
+
+        const selected_present_mode: vk.PresentModeKHR = selected_present_mode: {
+            const present_modes: []const vk.PresentModeKHR = try getPhysicalDeviceSurfacePresentModesKHRAlloc(
+                allocator,
+                instance_dsp,
+                physical_device,
+                surface_khr,
+            );
+            defer allocator.free(present_modes);
+
+            if (present_modes.len == 0) return error.NoSurfacePresentModesAvailable;
+            if (std.mem.indexOfScalar(vk.PresentModeKHR, present_modes, .mailbox_khr)) |i| {
+                break :selected_present_mode present_modes[i];
+            }
+            std.debug.assert(std.mem.indexOfScalar(vk.PresentModeKHR, present_modes, .fifo_khr) != null);
+            break :selected_present_mode .fifo_khr;
+        };
+
+        return SwapchainDetails{
+            .capabilities = capabilities,
+            .format = selected_format,
+            .present_mode = selected_present_mode,
+        };
+    }
+
     fn freeCStringSlice(allocator: std.mem.Allocator, extension_names: []const [*:0]const u8) void {
         for (extension_names) |p_ext_name| {
             const ext_name = std.mem.span(p_ext_name);
@@ -577,6 +641,52 @@ const VkEngine = struct {
         allocator.free(extension_names);
     }
 
+    pub fn getPhysicalDeviceSurfaceFormatsKHRAlloc(
+        allocator: std.mem.Allocator,
+        instance_dsp: InstanceDispatch,
+        physical_device: vk.PhysicalDevice,
+        surface_khr: vk.SurfaceKHR,
+    ) ![]vk.SurfaceFormatKHR {
+        var count: u32 = undefined;
+        if (instance_dsp.getPhysicalDeviceSurfaceFormatsKHR(physical_device, surface_khr, &count, null)) |result| switch (result) {
+            .success => {},
+            else => unreachable,
+        } else |err| return err;
+
+        const formats = try allocator.alloc(vk.SurfaceFormatKHR, count);
+        errdefer allocator.free(formats);
+
+        if (instance_dsp.getPhysicalDeviceSurfaceFormatsKHR(physical_device, surface_khr, &count, formats.ptr)) |result| switch (result) {
+            .success => {},
+            else => unreachable,
+        } else |err| return err;
+
+        std.debug.assert(formats.len == count);
+        return formats;
+    }
+    pub fn getPhysicalDeviceSurfacePresentModesKHRAlloc(
+        allocator: std.mem.Allocator,
+        instance_dsp: InstanceDispatch,
+        physical_device: vk.PhysicalDevice,
+        surface_khr: vk.SurfaceKHR,
+    ) ![]vk.PresentModeKHR {
+        var count: u32 = undefined;
+        if (instance_dsp.getPhysicalDeviceSurfacePresentModesKHR(physical_device, surface_khr, &count, null)) |result| switch (result) {
+            .success => {},
+            else => unreachable,
+        } else |err| return err;
+
+        const present_modes = try allocator.alloc(vk.PresentModeKHR, count);
+        errdefer allocator.free(present_modes);
+
+        if (instance_dsp.getPhysicalDeviceSurfacePresentModesKHR(physical_device, surface_khr, &count, present_modes.ptr)) |result| switch (result) {
+            .success => {},
+            else => unreachable,
+        } else |err| return err;
+
+        std.debug.assert(present_modes.len == count);
+        return present_modes;
+    }
     pub fn enumerateDeviceExtensionPropertiesAlloc(
         allocator: std.mem.Allocator,
         instance_dsp: InstanceDispatch,
