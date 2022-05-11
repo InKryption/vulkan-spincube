@@ -27,6 +27,7 @@ const InstanceDispatch = vk.InstanceWrapper(vk.InstanceCommandFlags{
     .destroySurfaceKHR = true,
 
     .createDevice = true,
+    .enumerateDeviceExtensionProperties = true,
 
     .createDebugUtilsMessengerEXT = build_options.vk_validation_layers,
     .destroyDebugUtilsMessengerEXT = build_options.vk_validation_layers,
@@ -149,6 +150,34 @@ const VkEngine = struct {
 
     pub fn getCoreDeviceQueue(self: VkEngine, comptime id: QueueFamilyId, index: u32) vk.Queue {
         return self.device.dsp.getDeviceQueue(self.device.handle, @field(self.queue_family_indices, @tagName(id)), index);
+    }
+
+    fn desiredInstanceLayerNames(allocator: std.mem.Allocator) ![]const [*:0]const u8 {
+        comptime if (!build_options.vk_validation_layers) return &.{};
+
+        var result = std.ArrayList([*:0]const u8).init(allocator);
+        errdefer freeCStringSlice(allocator, result.toOwnedSlice());
+
+        try result.append(try allocator.dupeZ(u8, "VK_LAYER_KHRONOS_validation"));
+
+        return result.toOwnedSlice();
+    }
+    fn desiredInstanceExtensionNames(allocator: std.mem.Allocator) ![]const [*:0]const u8 {
+        var result = std.ArrayList([*:0]const u8).init(allocator);
+        errdefer freeCStringSlice(allocator, result.toOwnedSlice());
+
+        const glfw_required_extensions = try glfw.getRequiredInstanceExtensions();
+        try result.ensureUnusedCapacity(glfw_required_extensions.len);
+        for (glfw_required_extensions) |p_ext_name| {
+            const ext_name = std.mem.span(p_ext_name);
+            result.appendAssumeCapacity(try allocator.dupeZ(u8, ext_name));
+        }
+
+        if (build_options.vk_validation_layers) {
+            try result.append(try allocator.dupeZ(u8, vk.extension_info.ext_debug_utils.name));
+        }
+
+        return result.toOwnedSlice();
     }
 
     fn initVkInst(allocator: std.mem.Allocator, instanceProcLoader: anytype) !VkInst {
@@ -426,6 +455,17 @@ const VkEngine = struct {
         return result;
     }
 
+    fn desiredDeviceExtensionNames(
+        allocator: std.mem.Allocator,
+    ) ![]const [*:0]const u8 {
+        var result = std.ArrayList([*:0]const u8).init(allocator);
+        errdefer freeCStringSlice(allocator, result.toOwnedSlice());
+
+        try result.append(try allocator.dupeZ(u8, vk.extension_info.khr_swapchain.name));
+
+        return result.toOwnedSlice();
+    }
+
     fn initVkDevice(
         allocator: std.mem.Allocator,
         instance_dsp: InstanceDispatch,
@@ -455,7 +495,9 @@ const VkEngine = struct {
         };
         defer allocator.free(queue_create_infos);
 
-        const enabled_extension_names: []const [*:0]const u8 = &.{};
+        const enabled_extension_names = try desiredDeviceExtensionNames(allocator);
+        defer freeCStringSlice(allocator, enabled_extension_names);
+
         const handle = try instance_dsp.createDevice(physical_device, &vk.DeviceCreateInfo{
             .flags = .{},
 
@@ -486,33 +528,6 @@ const VkEngine = struct {
         };
     }
 
-    fn desiredInstanceLayerNames(allocator: std.mem.Allocator) ![]const [*:0]const u8 {
-        comptime if (!build_options.vk_validation_layers) return &.{};
-
-        var result = std.ArrayList([*:0]const u8).init(allocator);
-        errdefer freeCStringSlice(allocator, result.toOwnedSlice());
-
-        try result.append(try allocator.dupeZ(u8, "VK_LAYER_KHRONOS_validation"));
-
-        return result.toOwnedSlice();
-    }
-    fn desiredInstanceExtensionNames(allocator: std.mem.Allocator) ![]const [*:0]const u8 {
-        var result = std.ArrayList([*:0]const u8).init(allocator);
-        errdefer freeCStringSlice(allocator, result.toOwnedSlice());
-
-        const glfw_required_extensions = try glfw.getRequiredInstanceExtensions();
-        try result.ensureUnusedCapacity(glfw_required_extensions.len);
-        for (glfw_required_extensions) |p_ext_name| {
-            const ext_name = std.mem.span(p_ext_name);
-            result.appendAssumeCapacity(try allocator.dupeZ(u8, ext_name));
-        }
-
-        if (build_options.vk_validation_layers) {
-            try result.append(try allocator.dupeZ(u8, vk.extension_info.ext_debug_utils.name));
-        }
-
-        return result.toOwnedSlice();
-    }
     fn freeCStringSlice(allocator: std.mem.Allocator, extension_names: []const [*:0]const u8) void {
         for (extension_names) |p_ext_name| {
             const ext_name = std.mem.span(p_ext_name);
@@ -521,6 +536,28 @@ const VkEngine = struct {
         allocator.free(extension_names);
     }
 
+    pub fn enumerateDeviceExtensionPropertiesAlloc(
+        allocator: std.mem.Allocator,
+        instance_dsp: InstanceDispatch,
+        physical_device: vk.PhysicalDevice,
+    ) ![]vk.ExtensionProperties {
+        var count: u32 = undefined;
+        if (instance_dsp.enumerateDeviceExtensionProperties(physical_device, null, &count, null)) |result| switch (result) {
+            .success => {},
+            else => unreachable,
+        } else |err| return err;
+
+        const extensions = try allocator.alloc(vk.ExtensionProperties, count);
+        errdefer allocator.free(extensions);
+
+        if (instance_dsp.enumerateDeviceExtensionProperties(physical_device, null, &count, extensions.ptr)) |result| switch (result) {
+            .success => {},
+            else => unreachable,
+        } else |err| return err;
+
+        std.debug.assert(extensions.len == count);
+        return extensions;
+    }
     pub fn getPhysicalDeviceQueueFamilyPropertiesAlloc(
         allocator: std.mem.Allocator,
         dsp: InstanceDispatch,
