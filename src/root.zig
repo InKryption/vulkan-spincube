@@ -48,65 +48,10 @@ pub fn main() !void {
 
     const allocator: std.mem.Allocator = gpa.allocator();
 
-    const Args = struct {
-        enable_debug_messenger: bool,
-    };
-    const args: Args = args: {
-        var args = OptionalFields(Args, true){};
-
-        var args_iter = try std.process.argsWithAllocator(allocator);
-        defer args_iter.deinit();
-
-        std.debug.assert(args_iter.skip());
-        while (args_iter.next()) |tok| {
-            if (std.mem.startsWith(u8, tok, "--enable-debug-messenger")) {
-                const start = "--enable-debug-messenger".len;
-                if (std.mem.eql(u8, tok[start..], "")) {
-                    args.enable_debug_messenger = true;
-                    continue;
-                }
-                if (std.mem.eql(u8, tok[start..], "=true")) {
-                    args.enable_debug_messenger = true;
-                    continue;
-                }
-                if (std.mem.eql(u8, tok[start..], "=false")) {
-                    args.enable_debug_messenger = false;
-                    continue;
-                }
-                if (std.mem.eql(u8, tok[start..], "=")) {
-                    const val_tok = args_iter.next() orelse return {
-                        std.log.err("Missing Argument value to '{s}'.", .{tok});
-                    };
-                    if (std.mem.eql(u8, val_tok, "true")) {
-                        args.enable_debug_messenger = true;
-                        continue;
-                    }
-                    if (std.mem.eql(u8, val_tok, "false")) {
-                        args.enable_debug_messenger = false;
-                        continue;
-                    }
-                    std.log.err("Invalid Argument value '{s}' to '{s}'.", .{ val_tok, tok });
-                    return;
-                }
-                std.log.err("Invalid Argument value to '{s}'.", .{tok});
-                return;
-            }
-            std.log.err("Unrecognized Argument '{s}'.", .{tok});
-            return;
-        }
-
-        break :args Args{
-            .enable_debug_messenger = args.enable_debug_messenger orelse build_options.vk_validation_layers,
-        };
-    };
-    std.log.info("{}", .{args});
-
     try glfw.init(.{});
     defer glfw.terminate();
 
-    const engine = try VkEngine.init(allocator, getInstanceProcAddress, .{
-        .enable_debug_messenger = args.enable_debug_messenger,
-    });
+    const engine = try VkEngine.init(allocator, getInstanceProcAddress);
     defer engine.deinit(allocator);
 }
 
@@ -116,22 +61,15 @@ const VkEngine = struct {
 
     const VkInst = struct { handle: vk.Instance, dsp: InstanceDispatch };
 
-    const InitConfig = struct {
-        enable_debug_messenger: bool = build_options.vk_validation_layers,
-    };
     pub fn init(
         allocator: std.mem.Allocator,
         instanceProcLoader: anytype,
-        config: InitConfig,
     ) !VkEngine {
         const inst: VkInst = try initVkInst(allocator, instanceProcLoader);
         errdefer inst.dsp.destroyInstance(inst.handle, &allocatorVulkanWrapper(&allocator));
 
         const debug_messenger = if (build_options.vk_validation_layers)
-            if (config.enable_debug_messenger)
-                try createVkDebugMessenger(allocator, inst)
-            else
-                .null_handle
+            try createVkDebugMessenger(allocator, inst)
         else {};
         errdefer if (build_options.vk_validation_layers and config.enable_debug_messenger) {
             destroyVkDebugMessenger(allocator, inst, debug_messenger);
@@ -353,7 +291,7 @@ const VkEngine = struct {
     }
 
     fn desiredInstanceLayerNames(allocator: std.mem.Allocator) ![]const [*:0]const u8 {
-        comptime if (builtin.mode != .Debug) return &.{};
+        comptime if (!build_options.vk_validation_layers) return &.{};
 
         var result = std.ArrayList([*:0]const u8).init(allocator);
         errdefer freeCStringSlice(allocator, result.toOwnedSlice());
