@@ -29,6 +29,10 @@ const InstanceDispatch = vk.InstanceWrapper(vk.InstanceCommandFlags{
     .createDebugUtilsMessengerEXT = build_options.vk_validation_layers,
     .destroyDebugUtilsMessengerEXT = build_options.vk_validation_layers,
 });
+const DeviceDispatchMin = vk.DeviceWrapper(vk.DeviceCommandFlags{ .destroyDevice = true });
+const DeviceDispatch = vk.DeviceWrapper(vk.DeviceCommandFlags{
+    .destroyDevice = true,
+});
 
 fn getInstanceProcAddress(handle: vk.Instance, name: [*:0]const u8) ?*const anyopaque {
     const inst_ptr = @intToPtr(?*anyopaque, @enumToInt(handle));
@@ -60,8 +64,10 @@ const VkEngine = struct {
     debug_messenger: if (build_options.vk_validation_layers) vk.DebugUtilsMessengerEXT else void,
     physical_device: vk.PhysicalDevice,
     queue_family_indices: QueueFamilyIndices,
+    device: VkDevice,
 
     const VkInst = struct { handle: vk.Instance, dsp: InstanceDispatch };
+    const VkDevice = struct { handle: vk.Device, dsp: DeviceDispatch };
 
     const QueueFamilyId = std.meta.FieldEnum(QueueFamilyIndices);
     const QueueFamilyIndices = struct {
@@ -85,113 +91,23 @@ const VkEngine = struct {
         const physical_device: vk.PhysicalDevice = try selectPhysicalDevice(allocator, inst);
         const queue_family_indices: QueueFamilyIndices = try selectQueueFamilyIndices(allocator, inst.dsp, physical_device);
 
+        const device = try initVkDevice(allocator, inst.dsp, physical_device, queue_family_indices);
+        errdefer device.dsp.destroyDevice(device.handle, &allocatorVulkanWrapper(&allocator));
+
         return VkEngine{
             .inst = inst,
             .debug_messenger = debug_messenger,
             .physical_device = physical_device,
             .queue_family_indices = queue_family_indices,
+            .device = device,
         };
     }
     pub fn deinit(self: VkEngine, allocator: std.mem.Allocator) void {
+        self.device.dsp.destroyDevice(self.device.handle, &allocatorVulkanWrapper(&allocator));
         if (build_options.vk_validation_layers) {
             self.inst.dsp.destroyDebugUtilsMessengerEXT(self.inst.handle, self.debug_messenger, &allocatorVulkanWrapper(&allocator));
         }
         self.inst.dsp.destroyInstance(self.inst.handle, &allocatorVulkanWrapper(&allocator));
-    }
-
-    fn selectQueueFamilyIndices(allocator: std.mem.Allocator, dsp: InstanceDispatch, physical_device: vk.PhysicalDevice) !QueueFamilyIndices {
-        var indices = std.EnumArray(QueueFamilyId, ?u32).initFill(null);
-
-        const qfam_properties: []const vk.QueueFamilyProperties = try getPhysicalDeviceQueueFamilyPropertiesAlloc(allocator, dsp, physical_device);
-        defer allocator.free(qfam_properties);
-
-        for (qfam_properties) |qfam, index| {
-            if (qfam.queue_flags.graphics_bit) {
-                indices.set(.graphics, @intCast(u32, index));
-            }
-        }
-
-        log_qfamily_indices: {
-            std.log.debug("Selected following queue family indices:", .{});
-            var iterator = indices.iterator();
-            while (iterator.next()) |entry| {
-                std.log.debug("  {s}: {}", .{ @tagName(entry.key), entry.value.* });
-            }
-            break :log_qfamily_indices;
-        }
-
-        var result: QueueFamilyIndices = undefined;
-        inline for (comptime std.enums.values(QueueFamilyId)) |tag| {
-            const tag_name = @tagName(tag);
-            const title_case = [_]u8{std.ascii.toUpper(tag_name[0])} ++ tag_name[@boolToInt(tag_name.len >= 1)..];
-            @field(result, @tagName(tag)) = indices.get(tag) orelse return @field(anyerror, "MissingFamilyQueueIndexFor" ++ title_case);
-        }
-        return result;
-    }
-    fn selectPhysicalDevice(allocator: std.mem.Allocator, inst: VkInst) !vk.PhysicalDevice {
-        const physical_devices = try enumeratePhysicalDevicesAlloc(allocator, inst.handle, inst.dsp);
-        defer allocator.free(physical_devices);
-
-        switch (physical_devices.len) {
-            0 => return error.NoPhysicalDevicesAvailable,
-            1 => return physical_devices[0],
-            2 => {
-                std.log.warn("TODO: Two physical devices available; no selection process implemented, defaulting to physical_devices[0].", .{});
-            },
-            else => {
-                std.log.warn("TODO: {d} physical devices available; no selection process implemented, defaulting to physical_devices[0].", .{physical_devices.len});
-            },
-        }
-        return physical_devices[0];
-    }
-
-    fn createVkDebugMessenger(allocator: std.mem.Allocator, inst: VkInst) !vk.DebugUtilsMessengerEXT {
-        return inst.dsp.createDebugUtilsMessengerEXT(inst.handle, &vk.DebugUtilsMessengerCreateInfoEXT{
-            .flags = vk.DebugUtilsMessengerCreateFlagsEXT{},
-            .message_severity = vk.DebugUtilsMessageSeverityFlagsEXT{
-                .verbose_bit_ext = true,
-                .info_bit_ext = true,
-                .warning_bit_ext = true,
-                .error_bit_ext = true,
-            },
-            .message_type = vk.DebugUtilsMessageTypeFlagsEXT{
-                .general_bit_ext = true,
-                .validation_bit_ext = true,
-                .performance_bit_ext = true,
-            },
-            .pfn_user_callback = vulkanDebugMessengerCallback,
-            .p_user_data = null,
-        }, &allocatorVulkanWrapper(&allocator));
-    }
-    fn destroyVkDebugMessenger(allocator: std.mem.Allocator, inst: VkInst, debug_messenger: vk.DebugUtilsMessengerEXT) void {
-        inst.dsp.destroyDebugUtilsMessengerEXT(inst.handle, debug_messenger, &allocatorVulkanWrapper(&allocator));
-    }
-    fn vulkanDebugMessengerCallback(
-        msg_severity_int: vk.DebugUtilsMessageSeverityFlagsEXT.IntType,
-        message_types: vk.DebugUtilsMessageTypeFlagsEXT.IntType,
-        opt_p_callback_data: ?*const vk.DebugUtilsMessengerCallbackDataEXT,
-        p_user_data: ?*anyopaque,
-    ) callconv(vk.vulkan_call_conv) vk.Bool32 {
-        _ = message_types;
-        _ = p_user_data;
-
-        const logger = std.log.scoped(.vulkan_debug_messenger);
-        const msg_severity = @bitCast(vk.DebugUtilsMessageSeverityFlagsEXT, msg_severity_int);
-        const level: std.log.Level = if (msg_severity.error_bit_ext)
-            .err
-        else if (msg_severity.warning_bit_ext)
-            .warn
-        else if (msg_severity.info_bit_ext) .info else std.log.Level.debug;
-
-        const p_callback_data = opt_p_callback_data orelse return vk.FALSE;
-        switch (level) {
-            .err => logger.err("{s}", .{p_callback_data.p_message}),
-            .warn => logger.warn("{s}", .{p_callback_data.p_message}),
-            .info => logger.info("{s}", .{p_callback_data.p_message}),
-            .debug => logger.debug("{s}", .{p_callback_data.p_message}),
-        }
-
-        return vk.FALSE;
     }
 
     fn initVkInst(allocator: std.mem.Allocator, instanceProcLoader: anytype) !VkInst {
@@ -336,13 +252,161 @@ const VkEngine = struct {
             else => err,
         };
         const dsp = InstanceDispatch.load(handle, instanceProcLoader) catch |err| {
-            const min_dsp = InstanceDispatchMin.load(handle, instanceProcLoader) catch return err;
+            const min_dsp = InstanceDispatchMin.load(handle, instanceProcLoader) catch {
+                std.log.err("Failed to load function to destroy instance, cleanup not possible.", .{});
+                return err;
+            };
             min_dsp.destroyInstance(handle, &allocatorVulkanWrapper(&allocator));
             return err;
         };
         errdefer dsp.destroyInstance(handle, &allocatorVulkanWrapper(&allocator));
 
         return VkInst{
+            .handle = handle,
+            .dsp = dsp,
+        };
+    }
+
+    fn createVkDebugMessenger(allocator: std.mem.Allocator, inst: VkInst) !vk.DebugUtilsMessengerEXT {
+        return inst.dsp.createDebugUtilsMessengerEXT(inst.handle, &vk.DebugUtilsMessengerCreateInfoEXT{
+            .flags = vk.DebugUtilsMessengerCreateFlagsEXT{},
+            .message_severity = vk.DebugUtilsMessageSeverityFlagsEXT{
+                .verbose_bit_ext = true,
+                .info_bit_ext = true,
+                .warning_bit_ext = true,
+                .error_bit_ext = true,
+            },
+            .message_type = vk.DebugUtilsMessageTypeFlagsEXT{
+                .general_bit_ext = true,
+                .validation_bit_ext = true,
+                .performance_bit_ext = true,
+            },
+            .pfn_user_callback = vulkanDebugMessengerCallback,
+            .p_user_data = null,
+        }, &allocatorVulkanWrapper(&allocator));
+    }
+    fn destroyVkDebugMessenger(allocator: std.mem.Allocator, inst: VkInst, debug_messenger: vk.DebugUtilsMessengerEXT) void {
+        inst.dsp.destroyDebugUtilsMessengerEXT(inst.handle, debug_messenger, &allocatorVulkanWrapper(&allocator));
+    }
+    fn vulkanDebugMessengerCallback(
+        msg_severity_int: vk.DebugUtilsMessageSeverityFlagsEXT.IntType,
+        message_types: vk.DebugUtilsMessageTypeFlagsEXT.IntType,
+        opt_p_callback_data: ?*const vk.DebugUtilsMessengerCallbackDataEXT,
+        p_user_data: ?*anyopaque,
+    ) callconv(vk.vulkan_call_conv) vk.Bool32 {
+        _ = message_types;
+        _ = p_user_data;
+
+        const logger = std.log.scoped(.vulkan_debug_messenger);
+        const msg_severity = @bitCast(vk.DebugUtilsMessageSeverityFlagsEXT, msg_severity_int);
+        const level: std.log.Level = if (msg_severity.error_bit_ext)
+            .err
+        else if (msg_severity.warning_bit_ext)
+            .warn
+        else if (msg_severity.info_bit_ext) .info else std.log.Level.debug;
+
+        const p_callback_data = opt_p_callback_data orelse return vk.FALSE;
+        switch (level) {
+            .err => logger.err("{s}", .{p_callback_data.p_message}),
+            .warn => logger.warn("{s}", .{p_callback_data.p_message}),
+            .info => logger.info("{s}", .{p_callback_data.p_message}),
+            .debug => logger.debug("{s}", .{p_callback_data.p_message}),
+        }
+
+        return vk.FALSE;
+    }
+
+    fn selectPhysicalDevice(allocator: std.mem.Allocator, inst: VkInst) !vk.PhysicalDevice {
+        const physical_devices = try enumeratePhysicalDevicesAlloc(allocator, inst.handle, inst.dsp);
+        defer allocator.free(physical_devices);
+
+        switch (physical_devices.len) {
+            0 => return error.NoPhysicalDevicesAvailable,
+            1 => return physical_devices[0],
+            2 => {
+                std.log.warn("TODO: Two physical devices available; no selection process implemented, defaulting to physical_devices[0].", .{});
+            },
+            else => {
+                std.log.warn("TODO: {d} physical devices available; no selection process implemented, defaulting to physical_devices[0].", .{physical_devices.len});
+            },
+        }
+        return physical_devices[0];
+    }
+    fn selectQueueFamilyIndices(allocator: std.mem.Allocator, dsp: InstanceDispatch, physical_device: vk.PhysicalDevice) !QueueFamilyIndices {
+        var indices = std.EnumArray(QueueFamilyId, ?u32).initFill(null);
+
+        const qfam_properties: []const vk.QueueFamilyProperties = try getPhysicalDeviceQueueFamilyPropertiesAlloc(allocator, dsp, physical_device);
+        defer allocator.free(qfam_properties);
+
+        for (qfam_properties) |qfam, index| {
+            if (qfam.queue_flags.graphics_bit) {
+                indices.set(.graphics, @intCast(u32, index));
+            }
+        }
+
+        log_qfamily_indices: {
+            std.log.debug("Selected following queue family indices:", .{});
+            var iterator = indices.iterator();
+            while (iterator.next()) |entry| {
+                std.log.debug("  {s}: {}", .{ @tagName(entry.key), entry.value.* });
+            }
+            break :log_qfamily_indices;
+        }
+
+        var result: QueueFamilyIndices = undefined;
+        inline for (comptime std.enums.values(QueueFamilyId)) |tag| {
+            const tag_name = @tagName(tag);
+            const title_case = [_]u8{std.ascii.toUpper(tag_name[0])} ++ tag_name[@boolToInt(tag_name.len >= 1)..];
+            @field(result, @tagName(tag)) = indices.get(tag) orelse return @field(anyerror, "MissingFamilyQueueIndexFor" ++ title_case);
+        }
+        return result;
+    }
+
+    fn initVkDevice(
+        allocator: std.mem.Allocator,
+        instance_dsp: InstanceDispatch,
+        physical_device: vk.PhysicalDevice,
+        queue_family_indices: QueueFamilyIndices,
+    ) !VkDevice {
+        const queue_create_infos = [_]vk.DeviceQueueCreateInfo{
+            .{
+                .flags = .{},
+                .queue_family_index = queue_family_indices.graphics,
+                .queue_count = 1,
+                .p_queue_priorities = std.mem.span(&[_]f32{1.0}).ptr,
+            },
+        };
+        _ = queue_create_infos;
+
+        const enabled_extension_names: []const [*:0]const u8 = &.{};
+
+        const create_info = vk.DeviceCreateInfo{
+            .flags = .{},
+
+            .queue_create_info_count = @intCast(u32, queue_create_infos.len),
+            .p_queue_create_infos = &queue_create_infos,
+
+            .enabled_layer_count = 0,
+            .pp_enabled_layer_names = std.mem.span(&[_][*:0]const u8{}).ptr,
+
+            .enabled_extension_count = @intCast(u32, enabled_extension_names.len),
+            .pp_enabled_extension_names = enabled_extension_names.ptr,
+
+            .p_enabled_features = null,
+        };
+
+        const handle = try instance_dsp.createDevice(physical_device, &create_info, &allocatorVulkanWrapper(&allocator));
+        const dsp = DeviceDispatch.load(handle, instance_dsp.dispatch.vkGetDeviceProcAddr) catch |err| {
+            const min_dsp = DeviceDispatchMin.load(handle, instance_dsp.dispatch.vkGetDeviceProcAddr) catch {
+                std.log.err("Failed to load function to destroy device, cleanup not possible.", .{});
+                return err;
+            };
+            min_dsp.destroyDevice(handle, &allocatorVulkanWrapper(&allocator));
+            return err;
+        };
+        errdefer dsp.destroyDevice(handle, &allocatorVulkanWrapper(&allocator));
+
+        return VkDevice{
             .handle = handle,
             .dsp = dsp,
         };
