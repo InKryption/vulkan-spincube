@@ -6,6 +6,7 @@ var log_file_writer: std.io.BufferedWriter(1024 * 8, std.fs.File.Writer) = undef
 
 const Config = struct {
     stderr_level: ?std.log.Level = null,
+    final_flush_retries: u16 = 100,
 };
 var config: Config = undefined;
 
@@ -20,7 +21,10 @@ pub fn init(rel_outpath: []const u8, cfg: Config) !void {
 pub fn deinit() void {
     var i: usize = 0;
     while (std.meta.isError(log_file_writer.flush())) : (i += 1) {
-        if (i > 100) break;
+        if (i >= config.final_flush_retries) {
+            std.debug.print("Failed to flush log file buffer.\n", .{});
+            break;
+        }
     }
 }
 
