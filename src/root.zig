@@ -1,8 +1,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
-const vk = @import("vulkan");
 const glfw = @import("glfw");
+const vk = @import("vulkan");
+const vkutil = @import("vkutil.zig");
 
 const BaseDispatch = vk.BaseWrapper(vk.BaseCommandFlags{
     .createInstance = true,
@@ -39,6 +40,8 @@ const DeviceDispatchMin = vk.DeviceWrapper(vk.DeviceCommandFlags{ .destroyDevice
 const DeviceDispatch = vk.DeviceWrapper(vk.DeviceCommandFlags{
     .destroyDevice = true,
     .getDeviceQueue = true,
+    .createSwapchainKHR = true,
+    .destroySwapchainKHR = true,
 });
 
 fn getInstanceProcAddress(handle: vk.Instance, name: [*:0]const u8) ?*const anyopaque {
@@ -90,6 +93,7 @@ const VkEngine = struct {
     device: VkDevice,
     surface_khr: vk.SurfaceKHR,
     swapchain_details: SwapchainDetails,
+    swapchain_khr: vk.SwapchainKHR,
 
     const VkInst = struct { handle: vk.Instance, dsp: InstanceDispatch };
     const VkDevice = struct { handle: vk.Device, dsp: DeviceDispatch };
@@ -104,6 +108,8 @@ const VkEngine = struct {
         capabilities: vk.SurfaceCapabilitiesKHR,
         format: vk.SurfaceFormatKHR,
         present_mode: vk.PresentModeKHR,
+        extent: vk.Extent2D,
+        image_count: u32,
     };
 
     pub fn init(
@@ -112,7 +118,7 @@ const VkEngine = struct {
         window: glfw.Window,
     ) !VkEngine {
         const inst: VkInst = try initVkInst(allocator, instanceProcLoader);
-        errdefer inst.dsp.destroyInstance(inst.handle, &allocatorVulkanWrapper(&allocator));
+        errdefer inst.dsp.destroyInstance(inst.handle, &vkutil.allocatorVulkanWrapper(&allocator));
 
         const debug_messenger = if (build_options.vk_validation_layers)
             try createVkDebugMessenger(allocator, inst)
@@ -125,7 +131,7 @@ const VkEngine = struct {
 
         const surface_khr: vk.SurfaceKHR = surface_khr: {
             var surface_khr: vk.SurfaceKHR = undefined;
-            if (glfw.createWindowSurface(inst.handle, window, @as(?*const vk.AllocationCallbacks, &allocatorVulkanWrapper(&allocator)), &surface_khr)) |result| {
+            if (glfw.createWindowSurface(inst.handle, window, @as(?*const vk.AllocationCallbacks, &vkutil.allocatorVulkanWrapper(&allocator)), &surface_khr)) |result| {
                 switch (@intToEnum(vk.Result, result)) {
                     .success => {},
                     else => std.log.warn("glfw.createWindowSurface: '{s}'.\n", .{@tagName(@intToEnum(vk.Result, result))}),
@@ -133,13 +139,22 @@ const VkEngine = struct {
             } else |err| return err;
             break :surface_khr surface_khr;
         };
-        errdefer inst.dsp.destroySurfaceKHR(inst.handle, surface_khr, &allocatorVulkanWrapper(&allocator));
+        errdefer inst.dsp.destroySurfaceKHR(inst.handle, surface_khr, &vkutil.allocatorVulkanWrapper(&allocator));
 
-        const swapchain_details = try querySwapchainSupportDetails(allocator, inst.dsp, physical_device, surface_khr);
         const queue_family_indices: QueueFamilyIndices = try selectQueueFamilyIndices(allocator, inst.dsp, physical_device, surface_khr);
 
         const device = try initVkDevice(allocator, inst.dsp, physical_device, queue_family_indices);
-        errdefer device.dsp.destroyDevice(device.handle, &allocatorVulkanWrapper(&allocator));
+        errdefer device.dsp.destroyDevice(device.handle, &vkutil.allocatorVulkanWrapper(&allocator));
+
+        const swapchain_details = try querySwapchainSupportDetails(allocator, inst.dsp, physical_device, surface_khr, framebuffer_size: {
+            const framebuffer_size = try window.getFramebufferSize();
+            break :framebuffer_size vk.Extent2D{
+                .width = framebuffer_size.width,
+                .height = framebuffer_size.height,
+            };
+        });
+        const swapchain_khr = try initSwapchain(allocator, device, queue_family_indices, surface_khr, swapchain_details);
+        errdefer device.dsp.destroySwapchainKHR(device.handle, swapchain_khr, &vkutil.allocatorVulkanWrapper(&allocator));
 
         return VkEngine{
             .inst = inst,
@@ -149,15 +164,17 @@ const VkEngine = struct {
             .device = device,
             .surface_khr = surface_khr,
             .swapchain_details = swapchain_details,
+            .swapchain_khr = swapchain_khr,
         };
     }
     pub fn deinit(self: VkEngine, allocator: std.mem.Allocator) void {
-        self.device.dsp.destroyDevice(self.device.handle, &allocatorVulkanWrapper(&allocator));
-        self.inst.dsp.destroySurfaceKHR(self.inst.handle, self.surface_khr, &allocatorVulkanWrapper(&allocator));
+        self.device.dsp.destroySwapchainKHR(self.device.handle, self.swapchain_khr, &vkutil.allocatorVulkanWrapper(&allocator));
+        self.device.dsp.destroyDevice(self.device.handle, &vkutil.allocatorVulkanWrapper(&allocator));
+        self.inst.dsp.destroySurfaceKHR(self.inst.handle, self.surface_khr, &vkutil.allocatorVulkanWrapper(&allocator));
         if (build_options.vk_validation_layers) {
-            self.inst.dsp.destroyDebugUtilsMessengerEXT(self.inst.handle, self.debug_messenger, &allocatorVulkanWrapper(&allocator));
+            self.inst.dsp.destroyDebugUtilsMessengerEXT(self.inst.handle, self.debug_messenger, &vkutil.allocatorVulkanWrapper(&allocator));
         }
-        self.inst.dsp.destroyInstance(self.inst.handle, &allocatorVulkanWrapper(&allocator));
+        self.inst.dsp.destroyInstance(self.inst.handle, &vkutil.allocatorVulkanWrapper(&allocator));
     }
 
     pub fn getCoreDeviceQueue(self: VkEngine, comptime id: QueueFamilyId, index: u32) vk.Queue {
@@ -201,7 +218,7 @@ const VkEngine = struct {
         const bd = try BaseDispatch.load(instanceProcLoader);
 
         const desired_layers = try desiredInstanceLayerNames(local_arena);
-        const available_layers: []const vk.LayerProperties = try enumerateInstanceLayerPropertiesAlloc(local_arena, bd);
+        const available_layers: []const vk.LayerProperties = try vkutil.enumerateInstanceLayerPropertiesAlloc(local_arena, bd);
         const available_layer_set: std.StringArrayHashMap(void).Unmanaged = available_layer_set: {
             var available_layer_set = std.StringArrayHashMap(void).init(local_arena);
 
@@ -231,7 +248,7 @@ const VkEngine = struct {
         };
 
         const desired_extensions = try desiredInstanceExtensionNames(local_arena);
-        const available_extensions = try enumerateInstanceExtensionPropertiesAlloc(local_arena, bd, null);
+        const available_extensions = try vkutil.enumerateInstanceExtensionPropertiesAlloc(local_arena, bd, null);
         const available_extension_set: std.StringArrayHashMap(void).Unmanaged = available_extension_set: {
             var available_extension_set = std.StringArrayHashMap(void).init(local_arena);
 
@@ -280,8 +297,8 @@ const VkEngine = struct {
                         .{
                             std.mem.sliceTo(&layer.layer_name, 0),
                             std.mem.sliceTo(&layer.description, 0),
-                            fmtApiVersion(layer.implementation_version),
-                            fmtApiVersion(layer.spec_version),
+                            vkutil.fmtApiVersion(layer.implementation_version),
+                            vkutil.fmtApiVersion(layer.spec_version),
                         },
                     );
                 }
@@ -299,7 +316,7 @@ const VkEngine = struct {
                         " * '{s}': {}\n",
                         .{
                             std.mem.sliceTo(&ext.extension_name, 0),
-                            fmtApiVersion(ext.spec_version),
+                            vkutil.fmtApiVersion(ext.spec_version),
                         },
                     );
                 }
@@ -326,7 +343,7 @@ const VkEngine = struct {
             .p_user_data = null,
         } else void{};
 
-        const handle = createInstance(allocator, bd, InstanceCreateInfo{
+        const handle = vkutil.createInstance(allocator, bd, vkutil.InstanceCreateInfo{
             .p_next = if (build_options.vk_validation_layers) &inst_debug_messenger_creation_info else null,
             .enabled_layer_names = selected_layers.keys(),
             .enabled_extension_names = selected_extensions.keys(),
@@ -339,10 +356,10 @@ const VkEngine = struct {
                 std.log.err("Failed to load function to destroy instance, cleanup not possible.", .{});
                 return err;
             };
-            min_dsp.destroyInstance(handle, &allocatorVulkanWrapper(&allocator));
+            min_dsp.destroyInstance(handle, &vkutil.allocatorVulkanWrapper(&allocator));
             return err;
         };
-        errdefer dsp.destroyInstance(handle, &allocatorVulkanWrapper(&allocator));
+        errdefer dsp.destroyInstance(handle, &vkutil.allocatorVulkanWrapper(&allocator));
 
         return VkInst{
             .handle = handle,
@@ -366,10 +383,10 @@ const VkEngine = struct {
             },
             .pfn_user_callback = vulkanDebugMessengerCallback,
             .p_user_data = null,
-        }, &allocatorVulkanWrapper(&allocator));
+        }, &vkutil.allocatorVulkanWrapper(&allocator));
     }
     fn destroyVkDebugMessenger(allocator: std.mem.Allocator, inst: VkInst, debug_messenger: vk.DebugUtilsMessengerEXT) void {
-        inst.dsp.destroyDebugUtilsMessengerEXT(inst.handle, debug_messenger, &allocatorVulkanWrapper(&allocator));
+        inst.dsp.destroyDebugUtilsMessengerEXT(inst.handle, debug_messenger, &vkutil.allocatorVulkanWrapper(&allocator));
     }
     fn vulkanDebugMessengerCallback(
         msg_severity_int: vk.DebugUtilsMessageSeverityFlagsEXT.IntType,
@@ -400,7 +417,7 @@ const VkEngine = struct {
     }
 
     fn selectPhysicalDevice(allocator: std.mem.Allocator, inst: VkInst) !vk.PhysicalDevice {
-        const physical_devices = try enumeratePhysicalDevicesAlloc(allocator, inst.handle, inst.dsp);
+        const physical_devices = try vkutil.enumeratePhysicalDevicesAlloc(allocator, inst.dsp, inst.handle);
         defer allocator.free(physical_devices);
 
         switch (physical_devices.len) {
@@ -423,7 +440,7 @@ const VkEngine = struct {
     ) !QueueFamilyIndices {
         var indices = std.EnumArray(QueueFamilyId, ?u32).initFill(null);
 
-        const qfam_properties: []const vk.QueueFamilyProperties = try getPhysicalDeviceQueueFamilyPropertiesAlloc(allocator, dsp, physical_device);
+        const qfam_properties: []const vk.QueueFamilyProperties = try vkutil.getPhysicalDeviceQueueFamilyPropertiesAlloc(allocator, dsp, physical_device);
         defer allocator.free(qfam_properties);
 
         for (qfam_properties) |qfam, i| {
@@ -511,7 +528,7 @@ const VkEngine = struct {
         const desired_extensions = try desiredDeviceExtensionNames(allocator);
         defer freeCStringSlice(allocator, desired_extensions);
 
-        const available_extensions = try enumerateDeviceExtensionPropertiesAlloc(allocator, instance_dsp, physical_device);
+        const available_extensions = try vkutil.enumerateDeviceExtensionPropertiesAlloc(allocator, instance_dsp, physical_device);
         defer allocator.free(available_extensions);
 
         const available_extension_set: std.StringArrayHashMapUnmanaged(void) = available_extension_set: {
@@ -564,16 +581,16 @@ const VkEngine = struct {
             .pp_enabled_extension_names = selected_extensions.keys().ptr,
 
             .p_enabled_features = null,
-        }, &allocatorVulkanWrapper(&allocator));
+        }, &vkutil.allocatorVulkanWrapper(&allocator));
         const dsp = DeviceDispatch.load(handle, instance_dsp.dispatch.vkGetDeviceProcAddr) catch |err| {
             const min_dsp = DeviceDispatchMin.load(handle, instance_dsp.dispatch.vkGetDeviceProcAddr) catch {
                 std.log.err("Failed to load function to destroy device, cleanup not possible.", .{});
                 return err;
             };
-            min_dsp.destroyDevice(handle, &allocatorVulkanWrapper(&allocator));
+            min_dsp.destroyDevice(handle, &vkutil.allocatorVulkanWrapper(&allocator));
             return err;
         };
-        errdefer dsp.destroyDevice(handle, &allocatorVulkanWrapper(&allocator));
+        errdefer dsp.destroyDevice(handle, &vkutil.allocatorVulkanWrapper(&allocator));
 
         return VkDevice{
             .handle = handle,
@@ -586,11 +603,12 @@ const VkEngine = struct {
         instance_dsp: InstanceDispatch,
         physical_device: vk.PhysicalDevice,
         surface_khr: vk.SurfaceKHR,
+        framebuffer_size: vk.Extent2D,
     ) !SwapchainDetails {
         const capabilities = try instance_dsp.getPhysicalDeviceSurfaceCapabilitiesKHR(physical_device, surface_khr);
 
         const selected_format: vk.SurfaceFormatKHR = selected_format: {
-            const formats: []const vk.SurfaceFormatKHR = try getPhysicalDeviceSurfaceFormatsKHRAlloc(
+            const formats: []const vk.SurfaceFormatKHR = try vkutil.getPhysicalDeviceSurfaceFormatsKHRAlloc(
                 allocator,
                 instance_dsp,
                 physical_device,
@@ -610,7 +628,7 @@ const VkEngine = struct {
         };
 
         const selected_present_mode: vk.PresentModeKHR = selected_present_mode: {
-            const present_modes: []const vk.PresentModeKHR = try getPhysicalDeviceSurfacePresentModesKHRAlloc(
+            const present_modes: []const vk.PresentModeKHR = try vkutil.getPhysicalDeviceSurfacePresentModesKHRAlloc(
                 allocator,
                 instance_dsp,
                 physical_device,
@@ -626,11 +644,64 @@ const VkEngine = struct {
             break :selected_present_mode .fifo_khr;
         };
 
+        const selected_extent: vk.Extent2D = selected_extent: {
+            if (std.math.maxInt(u32) != capabilities.current_extent.width and
+                std.math.maxInt(u32) != capabilities.current_extent.height)
+            {
+                break :selected_extent capabilities.current_extent;
+            }
+
+            break :selected_extent vk.Extent2D{
+                .width = std.math.clamp(framebuffer_size.width, capabilities.min_image_extent.width, capabilities.max_image_extent.width),
+                .height = std.math.clamp(framebuffer_size.height, capabilities.min_image_extent.height, capabilities.max_image_extent.height),
+            };
+        };
+
+        const image_count: u32 = image_count: {
+            const min_image_count: u32 = capabilities.min_image_count;
+            const max_image_count: u32 = if (capabilities.max_image_count == 0) std.math.maxInt(u32) else capabilities.max_image_count;
+            break :image_count std.math.clamp(min_image_count + 1, min_image_count, max_image_count);
+        };
+
         return SwapchainDetails{
             .capabilities = capabilities,
             .format = selected_format,
             .present_mode = selected_present_mode,
+            .extent = selected_extent,
+            .image_count = image_count,
         };
+    }
+
+    fn initSwapchain(allocator: std.mem.Allocator, device: VkDevice, qfi: QueueFamilyIndices, surface_khr: vk.SurfaceKHR, details: SwapchainDetails) !vk.SwapchainKHR {
+        const queue_family_indices: std.BoundedArray(u32, std.meta.fields(QueueFamilyIndices).len) = queue_family_indices: {
+            var queue_family_indices = std.BoundedArray(u32, std.meta.fields(QueueFamilyIndices).len).init(0) catch unreachable;
+            if (qfi.graphics != qfi.present) {
+                queue_family_indices.appendSlice(&.{ qfi.graphics, qfi.present }) catch unreachable;
+            }
+            break :queue_family_indices queue_family_indices;
+        };
+        const create_info = vk.SwapchainCreateInfoKHR{
+            .flags = vk.SwapchainCreateFlagsKHR{},
+            .surface = surface_khr,
+
+            .min_image_count = details.image_count,
+            .image_format = details.format.format,
+            .image_color_space = details.format.color_space,
+            .image_extent = details.extent,
+            .image_array_layers = 1,
+            .image_usage = vk.ImageUsageFlags{ .color_attachment_bit = true },
+
+            .image_sharing_mode = if (queue_family_indices.len > 1) .concurrent else .exclusive,
+            .queue_family_index_count = @intCast(u32, queue_family_indices.len),
+            .p_queue_family_indices = queue_family_indices.slice().ptr,
+
+            .pre_transform = details.capabilities.current_transform,
+            .composite_alpha = vk.CompositeAlphaFlagsKHR{ .opaque_bit_khr = true },
+            .present_mode = details.present_mode,
+            .clipped = vk.TRUE,
+            .old_swapchain = .null_handle,
+        };
+        return device.dsp.createSwapchainKHR(device.handle, &create_info, &vkutil.allocatorVulkanWrapper(&allocator));
     }
 
     fn freeCStringSlice(allocator: std.mem.Allocator, extension_names: []const [*:0]const u8) void {
@@ -640,354 +711,7 @@ const VkEngine = struct {
         }
         allocator.free(extension_names);
     }
-
-    pub fn getPhysicalDeviceSurfaceFormatsKHRAlloc(
-        allocator: std.mem.Allocator,
-        instance_dsp: InstanceDispatch,
-        physical_device: vk.PhysicalDevice,
-        surface_khr: vk.SurfaceKHR,
-    ) ![]vk.SurfaceFormatKHR {
-        var count: u32 = undefined;
-        if (instance_dsp.getPhysicalDeviceSurfaceFormatsKHR(physical_device, surface_khr, &count, null)) |result| switch (result) {
-            .success => {},
-            else => unreachable,
-        } else |err| return err;
-
-        const formats = try allocator.alloc(vk.SurfaceFormatKHR, count);
-        errdefer allocator.free(formats);
-
-        if (instance_dsp.getPhysicalDeviceSurfaceFormatsKHR(physical_device, surface_khr, &count, formats.ptr)) |result| switch (result) {
-            .success => {},
-            else => unreachable,
-        } else |err| return err;
-
-        std.debug.assert(formats.len == count);
-        return formats;
-    }
-    pub fn getPhysicalDeviceSurfacePresentModesKHRAlloc(
-        allocator: std.mem.Allocator,
-        instance_dsp: InstanceDispatch,
-        physical_device: vk.PhysicalDevice,
-        surface_khr: vk.SurfaceKHR,
-    ) ![]vk.PresentModeKHR {
-        var count: u32 = undefined;
-        if (instance_dsp.getPhysicalDeviceSurfacePresentModesKHR(physical_device, surface_khr, &count, null)) |result| switch (result) {
-            .success => {},
-            else => unreachable,
-        } else |err| return err;
-
-        const present_modes = try allocator.alloc(vk.PresentModeKHR, count);
-        errdefer allocator.free(present_modes);
-
-        if (instance_dsp.getPhysicalDeviceSurfacePresentModesKHR(physical_device, surface_khr, &count, present_modes.ptr)) |result| switch (result) {
-            .success => {},
-            else => unreachable,
-        } else |err| return err;
-
-        std.debug.assert(present_modes.len == count);
-        return present_modes;
-    }
-    pub fn enumerateDeviceExtensionPropertiesAlloc(
-        allocator: std.mem.Allocator,
-        instance_dsp: InstanceDispatch,
-        physical_device: vk.PhysicalDevice,
-    ) ![]vk.ExtensionProperties {
-        var count: u32 = undefined;
-        if (instance_dsp.enumerateDeviceExtensionProperties(physical_device, null, &count, null)) |result| switch (result) {
-            .success => {},
-            else => unreachable,
-        } else |err| return err;
-
-        const extensions = try allocator.alloc(vk.ExtensionProperties, count);
-        errdefer allocator.free(extensions);
-
-        if (instance_dsp.enumerateDeviceExtensionProperties(physical_device, null, &count, extensions.ptr)) |result| switch (result) {
-            .success => {},
-            else => unreachable,
-        } else |err| return err;
-
-        std.debug.assert(extensions.len == count);
-        return extensions;
-    }
-    pub fn getPhysicalDeviceQueueFamilyPropertiesAlloc(
-        allocator: std.mem.Allocator,
-        dsp: InstanceDispatch,
-        physical_device: vk.PhysicalDevice,
-    ) ![]vk.QueueFamilyProperties {
-        var count: u32 = undefined;
-
-        dsp.getPhysicalDeviceQueueFamilyProperties(physical_device, &count, null);
-        const properties = try allocator.alloc(vk.QueueFamilyProperties, count);
-        errdefer allocator.free(properties);
-
-        dsp.getPhysicalDeviceQueueFamilyProperties(physical_device, &count, properties.ptr);
-        std.debug.assert(properties.len == count);
-
-        return properties;
-    }
-    pub fn enumeratePhysicalDevicesAlloc(allocator: std.mem.Allocator, instance: vk.Instance, dsp: InstanceDispatch) ![]vk.PhysicalDevice {
-        var count: u32 = undefined;
-        if (dsp.enumeratePhysicalDevices(instance, &count, null)) |result| switch (result) {
-            .success => {},
-            else => unreachable,
-        } else |err| return err;
-
-        const physical_devices = try allocator.alloc(vk.PhysicalDevice, count);
-        errdefer allocator.free(physical_devices);
-
-        if (dsp.enumeratePhysicalDevices(instance, &count, physical_devices.ptr)) |result| switch (result) {
-            .success => {},
-            else => unreachable,
-        } else |err| return err;
-
-        std.debug.assert(physical_devices.len == count);
-        return physical_devices;
-    }
-    pub const InstanceCreateInfo = struct {
-        p_next: ?*const anyopaque = null,
-
-        flags: vk.InstanceCreateFlags = .{},
-        application_info: ?ApplicationInfo = null,
-
-        enabled_layer_names: []const [*:0]const u8 = &.{},
-        enabled_extension_names: []const [*:0]const u8 = &.{},
-
-        pub const ApplicationInfo = struct {
-            application_name: ?[:0]const u8,
-            application_version: u32,
-
-            engine_name: ?[:0]const u8,
-            engine_version: u32,
-
-            api_version: ApiVersion,
-
-            pub const ApiVersion = enum(u32) {
-                @"1_0" = vk.API_VERSION_1_0,
-                @"1_1" = vk.API_VERSION_1_1,
-                @"1_2" = vk.API_VERSION_1_2,
-                @"1_3" = vk.API_VERSION_1_3,
-                _,
-            };
-        };
-    };
-    pub fn createInstance(
-        allocator: std.mem.Allocator,
-        bd: BaseDispatch,
-        instance_create_info: InstanceCreateInfo,
-    ) !vk.Instance {
-        const maybe_app_info: ?vk.ApplicationInfo = if (instance_create_info.application_info) |app_info| vk.ApplicationInfo{
-            .p_application_name = if (app_info.application_name) |app_name| app_name.ptr else null,
-            .application_version = app_info.application_version,
-
-            .p_engine_name = if (app_info.engine_name) |engine_name| engine_name.ptr else null,
-            .engine_version = app_info.engine_version,
-
-            .api_version = @enumToInt(app_info.api_version),
-        } else null;
-        const p_app_info: ?*const vk.ApplicationInfo = if (maybe_app_info) |*app_info| app_info else null;
-
-        const create_info = vk.InstanceCreateInfo{
-            .p_next = instance_create_info.p_next,
-
-            .flags = instance_create_info.flags,
-            .p_application_info = p_app_info,
-
-            .enabled_layer_count = @intCast(u32, instance_create_info.enabled_layer_names.len),
-            .pp_enabled_layer_names = instance_create_info.enabled_layer_names.ptr,
-
-            .enabled_extension_count = @intCast(u32, instance_create_info.enabled_extension_names.len),
-            .pp_enabled_extension_names = instance_create_info.enabled_extension_names.ptr,
-        };
-
-        return bd.createInstance(&create_info, &allocatorVulkanWrapper(&allocator));
-    }
-    pub fn enumerateInstanceLayerPropertiesAlloc(
-        allocator: std.mem.Allocator,
-        bd: BaseDispatch,
-    ) ![]vk.LayerProperties {
-        var count: u32 = undefined;
-        if (bd.enumerateInstanceLayerProperties(&count, null)) |result| switch (result) {
-            .success => {},
-            else => unreachable,
-        } else |err| return err;
-
-        const layers = try allocator.alloc(vk.LayerProperties, count);
-        errdefer allocator.free(layers);
-
-        if (bd.enumerateInstanceLayerProperties(&count, layers.ptr)) |result| switch (result) {
-            .success => {},
-            else => unreachable,
-        } else |err| return err;
-
-        std.debug.assert(layers.len == count);
-        return layers;
-    }
-    pub fn enumerateInstanceExtensionPropertiesAlloc(
-        allocator: std.mem.Allocator,
-        bd: BaseDispatch,
-        layer_name: ?[:0]const u8,
-    ) ![]vk.ExtensionProperties {
-        const p_layer_name: ?[*:0]const u8 = if (layer_name) |ln| ln.ptr else null;
-
-        var count: u32 = undefined;
-        if (bd.enumerateInstanceExtensionProperties(p_layer_name, &count, null)) |result| switch (result) {
-            .success => {},
-            else => unreachable,
-        } else |err| return err;
-
-        const extensions = try allocator.alloc(vk.ExtensionProperties, count);
-        errdefer allocator.free(extensions);
-
-        if (bd.enumerateInstanceExtensionProperties(p_layer_name, &count, extensions.ptr)) |result| switch (result) {
-            .success => {},
-            else => unreachable,
-        } else |err| return err;
-
-        std.debug.assert(extensions.len == count);
-        return extensions;
-    }
-    pub fn enumerateInstanceExtensionPropertiesMultipleLayersAlloc(
-        allocator: std.mem.Allocator,
-        bd: BaseDispatch,
-        include_base: bool,
-        layer_names: []const [:0]const u8,
-    ) ![]vk.ExtensionProperties {
-        const counts = try allocator.alloc(u32, @boolToInt(include_base) + layer_names.len);
-        defer allocator.free(counts);
-
-        for (layer_names) |layer_name, i| {
-            if (bd.enumerateInstanceExtensionProperties(layer_name.ptr, &counts[i], null)) |result| switch (result) {
-                .success => {},
-                else => unreachable,
-            } else |err| return err;
-        }
-
-        const extensions = try allocator.alloc(vk.ExtensionProperties, full_count: {
-            var full_count: usize = 0;
-            for (counts) |count| {
-                full_count += count;
-            }
-            break :full_count full_count;
-        });
-        errdefer allocator.free(extensions);
-
-        {
-            var start: usize = 0;
-            for (layer_names) |layer_name, i| {
-                const len = counts[i];
-
-                if (bd.enumerateInstanceExtensionProperties(layer_name.ptr, &counts[i], extensions[start .. start + len].ptr)) |result| switch (result) {
-                    .success => {},
-                    else => unreachable,
-                } else |err| return err;
-
-                std.debug.assert(len == counts[i]);
-                start += len;
-            }
-        }
-
-        return extensions;
-    }
 };
-
-fn allocatorVulkanWrapper(p_allocator: *const std.mem.Allocator) vk.AllocationCallbacks {
-    const static = struct {
-        const Metadata = struct {
-            len: usize,
-            alignment: u29,
-        };
-        fn allocation(
-            p_user_data: ?*anyopaque,
-            size: usize,
-            alignment: usize,
-            allocation_scope: vk.SystemAllocationScope,
-        ) callconv(vk.vulkan_call_conv) ?*anyopaque {
-            _ = allocation_scope;
-            const allocator = @ptrCast(*const std.mem.Allocator, @alignCast(@alignOf(std.mem.Allocator), p_user_data)).*;
-
-            if (size == 0) return null;
-
-            const bytes = allocator.allocBytes(@intCast(u29, alignment), @sizeOf(Metadata) + size, 0, @returnAddress()) catch return null;
-            std.mem.bytesAsValue(Metadata, bytes[0..@sizeOf(Metadata)]).* = .{
-                .len = size,
-                .alignment = @intCast(u29, alignment),
-            };
-
-            return @ptrCast(*anyopaque, bytes[@sizeOf(Metadata)..].ptr);
-        }
-
-        fn reallocation(
-            p_user_data: ?*anyopaque,
-            p_original: ?*anyopaque,
-            size: usize,
-            alignment: usize,
-            allocation_scope: vk.SystemAllocationScope,
-        ) callconv(vk.vulkan_call_conv) ?*anyopaque {
-            if (size == 0) {
-                free(p_user_data, p_original);
-                return null;
-            }
-
-            const allocator = @ptrCast(*const std.mem.Allocator, @alignCast(@alignOf(std.mem.Allocator), p_user_data)).*;
-
-            const old_ptr = (@ptrCast([*]u8, p_original orelse return allocation(p_user_data, size, alignment, allocation_scope)) - @sizeOf(Metadata));
-            const old_metadata = std.mem.bytesToValue(Metadata, old_ptr[0..@sizeOf(Metadata)]);
-
-            const old_bytes = old_ptr[0 .. @sizeOf(Metadata) + old_metadata.len];
-            const new_bytes = allocator.reallocBytes(old_bytes, old_metadata.alignment, size, @intCast(u29, alignment), 0, @returnAddress()) catch return null;
-
-            std.mem.bytesAsValue(Metadata, new_bytes[0..@sizeOf(Metadata)]).* = .{
-                .len = size,
-                .alignment = @intCast(u29, alignment),
-            };
-            return @ptrCast(*anyopaque, new_bytes[@sizeOf(Metadata)..].ptr);
-        }
-
-        fn free(
-            p_user_data: ?*anyopaque,
-            p_memory: ?*anyopaque,
-        ) callconv(vk.vulkan_call_conv) void {
-            const allocator = @ptrCast(*const std.mem.Allocator, @alignCast(@alignOf(std.mem.Allocator), p_user_data)).*;
-
-            const ptr = (@ptrCast([*]u8, p_memory orelse return) - @sizeOf(Metadata));
-            const metadata = std.mem.bytesToValue(Metadata, ptr[0..@sizeOf(Metadata)]);
-
-            const bytes = ptr[0 .. @sizeOf(Metadata) + metadata.len];
-            return allocator.rawFree(bytes, metadata.alignment, @returnAddress());
-        }
-    };
-    return vk.AllocationCallbacks{
-        .p_user_data = @intToPtr(*anyopaque, @ptrToInt(p_allocator)),
-        .pfn_allocation = static.allocation,
-        .pfn_reallocation = static.reallocation,
-        .pfn_free = static.free,
-        .pfn_internal_allocation = null,
-        .pfn_internal_free = null,
-    };
-}
-
-fn fmtApiVersion(version_bits: u32) std.fmt.Formatter(formatApiVersion) {
-    return .{ .data = version_bits };
-}
-fn formatApiVersion(
-    version_bits: u32,
-    comptime fmt_str: []const u8,
-    options: std.fmt.FormatOptions,
-    writer: anytype,
-) @TypeOf(writer).Error!void {
-    _ = fmt_str;
-    _ = options;
-
-    const variant = vk.apiVersionVariant(version_bits);
-    const major = vk.apiVersionMajor(version_bits);
-    const minor = vk.apiVersionMinor(version_bits);
-    const patch = vk.apiVersionPatch(version_bits);
-
-    if (comptime fmt_str.len > 0 and fmt_str[0] == 'v') {
-        try writer.print("{d}.", .{variant});
-    }
-    try writer.print("{d}.{d}.{d}", .{ major, minor, patch });
-}
 
 const ArrayCStringContext = struct {
     pub fn hash(ctx: @This(), p_str: [*:0]const u8) u32 {
