@@ -43,8 +43,10 @@ const DeviceDispatch = vk.DeviceWrapper(vk.DeviceCommandFlags{
 
     .createSwapchainKHR = true,
     .destroySwapchainKHR = true,
-
     .getSwapchainImagesKHR = true,
+
+    .createImageView = true,
+    .destroyImageView = true,
 });
 
 fn getInstanceProcAddress(handle: vk.Instance, name: [*:0]const u8) ?*const anyopaque {
@@ -153,18 +155,15 @@ fn desiredDeviceExtensionNames(allocator: std.mem.Allocator, comptime StrType: t
 }
 
 pub fn main() !void {
-    try file_logger.init("vulkan-spincube.log", .{ .stderr_level = .err }, &.{.gpa});
+    try file_logger.init("vulkan-spincube.log", .{ .stderr_level = .err }, &.{ .gpa });
     defer file_logger.deinit();
 
-    var gpa = if (builtin.mode == .Debug) std.heap.GeneralPurposeAllocator(.{ .verbose_log = true }){};
+    var gpa = if (builtin.mode == .Debug) std.heap.GeneralPurposeAllocator(.{ .verbose_log = true, .stack_trace_frames = 8 }){};
     defer if (builtin.mode == .Debug) {
         _ = gpa.deinit();
     };
 
-    var arena = std.heap.ArenaAllocator.init(if (builtin.mode == .Debug) gpa.allocator() else std.heap.page_allocator);
-    defer arena.deinit();
-
-    const allocator: std.mem.Allocator = arena.allocator();
+    const allocator: std.mem.Allocator = if (builtin.mode == .Debug) gpa.allocator() else std.heap.c_allocator;
 
     try glfw.init(.{});
     defer glfw.terminate();
@@ -172,7 +171,7 @@ pub fn main() !void {
     const window = try glfw.Window.create(100, 100, "vulkan-spincube", null, null, glfw.Window.Hints{ .client_api = .no_api });
     defer window.destroy();
 
-    const engine = try VkEngine.init(allocator, getInstanceProcAddress, window);
+    var engine = try VkEngine.init(allocator, getInstanceProcAddress, window);
     defer engine.deinit(allocator);
 
     _ = engine.getCoreDeviceQueue(.present, 0);
@@ -187,7 +186,7 @@ const VkEngine = struct {
     inst: VkInst,
     debug_messenger: if (build_options.vk_validation_layers) vk.DebugUtilsMessengerEXT else void,
     physical_device: vk.PhysicalDevice,
-    queue_family_indices: QueueFamilyIndices,
+    core_qfi: CoreQueueFamilyIndices,
     device: VkDevice,
     surface_khr: vk.SurfaceKHR,
     swapchain_details: SwapchainDetails,
@@ -196,10 +195,10 @@ const VkEngine = struct {
 
     const VkInst = struct { handle: vk.Instance, dsp: InstanceDispatch };
     const VkDevice = struct { handle: vk.Device, dsp: DeviceDispatch };
-    const ImageHandleViewPair = struct { img: vk.Image, vew: vk.ImageView };
+    const ImageHandleViewPair = struct { img: vk.Image, view: vk.ImageView };
 
-    const QueueFamilyId = std.meta.FieldEnum(QueueFamilyIndices);
-    const QueueFamilyIndices = struct {
+    const CoreQueueFamilyId = std.meta.FieldEnum(CoreQueueFamilyIndices);
+    const CoreQueueFamilyIndices = struct {
         graphics: u32,
         present: u32,
     };
@@ -241,14 +240,13 @@ const VkEngine = struct {
         };
         errdefer inst.dsp.destroySurfaceKHR(inst.handle, surface_khr, &vkutil.allocatorVulkanWrapper(&allocator));
 
-        const queue_family_indices: QueueFamilyIndices = try selectQueueFamilyIndices(allocator, inst.dsp, physical_device, surface_khr);
+        const core_qfi: CoreQueueFamilyIndices = try selectQueueFamilyIndices(allocator, inst.dsp, physical_device, surface_khr);
 
-        const device = try initVkDevice(allocator, inst.dsp, physical_device, queue_family_indices);
+        const device = try initVkDevice(allocator, inst.dsp, physical_device, core_qfi);
         errdefer device.dsp.destroyDevice(device.handle, &vkutil.allocatorVulkanWrapper(&allocator));
 
-        const swapchain_details = swapchain_details: {
+        const swapchain_details: SwapchainDetails = swapchain_details: {
             const capabilities = try inst.dsp.getPhysicalDeviceSurfaceCapabilitiesKHR(physical_device, surface_khr);
-
             const selected_format: vk.SurfaceFormatKHR = selected_format: {
                 const formats: []const vk.SurfaceFormatKHR = try vkutil.getPhysicalDeviceSurfaceFormatsKHRAlloc(
                     allocator,
@@ -268,7 +266,6 @@ const VkEngine = struct {
 
                 break :selected_format formats[0];
             };
-
             const selected_present_mode: vk.PresentModeKHR = selected_present_mode: {
                 const present_modes: []const vk.PresentModeKHR = try vkutil.getPhysicalDeviceSurfacePresentModesKHRAlloc(
                     allocator,
@@ -285,7 +282,6 @@ const VkEngine = struct {
                 std.debug.assert(std.mem.indexOfScalar(vk.PresentModeKHR, present_modes, .fifo_khr) != null);
                 break :selected_present_mode .fifo_khr;
             };
-
             const selected_extent: vk.Extent2D = selected_extent: {
                 if (std.math.maxInt(u32) != capabilities.current_extent.width and
                     std.math.maxInt(u32) != capabilities.current_extent.height)
@@ -306,13 +302,11 @@ const VkEngine = struct {
                     .height = std.math.clamp(framebuffer_size.height, capabilities.min_image_extent.height, capabilities.max_image_extent.height),
                 };
             };
-
             const image_count: u32 = image_count: {
                 const min_image_count: u32 = capabilities.min_image_count;
                 const max_image_count: u32 = if (capabilities.max_image_count == 0) std.math.maxInt(u32) else capabilities.max_image_count;
                 break :image_count std.math.clamp(min_image_count + 1, min_image_count, max_image_count);
             };
-
             break :swapchain_details SwapchainDetails{
                 .capabilities = capabilities,
                 .format = selected_format,
@@ -321,7 +315,37 @@ const VkEngine = struct {
                 .image_count = image_count,
             };
         };
-        const swapchain_khr = try initSwapchain(allocator, device, queue_family_indices, surface_khr, swapchain_details);
+        const swapchain_khr = swapchain_khr: {
+            const qfi_array: std.BoundedArray(u32, std.meta.fields(CoreQueueFamilyIndices).len) = qfi_array: {
+                var qfi_array = std.BoundedArray(u32, std.meta.fields(CoreQueueFamilyIndices).len).init(0) catch unreachable;
+                if (core_qfi.graphics != core_qfi.present) {
+                    qfi_array.appendSlice(&.{ core_qfi.graphics, core_qfi.present }) catch unreachable;
+                }
+                break :qfi_array qfi_array;
+            };
+
+            break :swapchain_khr try device.dsp.createSwapchainKHR(device.handle, &vk.SwapchainCreateInfoKHR{
+                .flags = vk.SwapchainCreateFlagsKHR{},
+                .surface = surface_khr,
+
+                .min_image_count = swapchain_details.image_count,
+                .image_format = swapchain_details.format.format,
+                .image_color_space = swapchain_details.format.color_space,
+                .image_extent = swapchain_details.extent,
+                .image_array_layers = 1,
+                .image_usage = vk.ImageUsageFlags{ .color_attachment_bit = true },
+
+                .image_sharing_mode = if (qfi_array.len > 1) .concurrent else .exclusive,
+                .queue_family_index_count = @intCast(u32, qfi_array.len),
+                .p_queue_family_indices = qfi_array.slice().ptr,
+
+                .pre_transform = swapchain_details.capabilities.current_transform,
+                .composite_alpha = vk.CompositeAlphaFlagsKHR{ .opaque_bit_khr = true },
+                .present_mode = swapchain_details.present_mode,
+                .clipped = vk.TRUE,
+                .old_swapchain = .null_handle,
+            }, &vkutil.allocatorVulkanWrapper(&allocator));
+        };
         errdefer device.dsp.destroySwapchainKHR(device.handle, swapchain_khr, &vkutil.allocatorVulkanWrapper(&allocator));
 
         const swapchain_images: std.MultiArrayList(ImageHandleViewPair).Slice = swapchain_images: {
@@ -336,13 +360,50 @@ const VkEngine = struct {
                 } else |err| return err;
 
                 std.debug.assert(count >= swapchain_details.image_count);
-                try swapchain_images.ensureTotalCapacity(allocator, count);
+                try swapchain_images.resize(allocator, count);
+
+                if (device.dsp.getSwapchainImagesKHR(device.handle, swapchain_khr, &count, swapchain_images.items(.img).ptr)) |result| switch (result) {
+                    .success => {},
+                    else => unreachable,
+                } else |err| return err;
+            }
+
+            const images: []const vk.Image = swapchain_images.items(.img);
+            for (swapchain_images.items(.view)) |*p_view, i| {
+                const view_create_info = vk.ImageViewCreateInfo{
+                    .flags = vk.ImageViewCreateFlags{},
+                    .image = images[i],
+                    .view_type = .@"2d",
+                    .format = swapchain_details.format.format,
+                    .components = vk.ComponentMapping{
+                        .r = .identity,
+                        .g = .identity,
+                        .b = .identity,
+                        .a = .identity,
+                    },
+                    .subresource_range = vk.ImageSubresourceRange{
+                        .aspect_mask = vk.ImageAspectFlags{ .color_bit = true },
+                        .base_mip_level = 0,
+                        .level_count = 1,
+                        .base_array_layer = 0,
+                        .layer_count = 1,
+                    },
+                };
+                p_view.* = device.dsp.createImageView(device.handle, &view_create_info, &vkutil.allocatorVulkanWrapper(&allocator)) catch |err| {
+                    for (swapchain_images.items(.view)) |view| {
+                        device.dsp.destroyImageView(device.handle, view, &vkutil.allocatorVulkanWrapper(&allocator));
+                    }
+                    return err;
+                };
             }
 
             break :swapchain_images swapchain_images.toOwnedSlice();
         };
         errdefer {
             var copy = swapchain_images;
+            for (copy.items(.view)) |view| {
+                device.dsp.destroyImageView(device.handle, view, &vkutil.allocatorVulkanWrapper(&allocator));
+            }
             copy.deinit(allocator);
         }
 
@@ -350,7 +411,7 @@ const VkEngine = struct {
             .inst = inst,
             .debug_messenger = debug_messenger,
             .physical_device = physical_device,
-            .queue_family_indices = queue_family_indices,
+            .core_qfi = core_qfi,
             .device = device,
             .surface_khr = surface_khr,
             .swapchain_details = swapchain_details,
@@ -358,18 +419,25 @@ const VkEngine = struct {
             .swapchain_images = swapchain_images,
         };
     }
-    pub fn deinit(self: VkEngine, allocator: std.mem.Allocator) void {
-        self.device.dsp.destroySwapchainKHR(self.device.handle, self.swapchain_khr, &vkutil.allocatorVulkanWrapper(&allocator));
-        self.device.dsp.destroyDevice(self.device.handle, &vkutil.allocatorVulkanWrapper(&allocator));
-        self.inst.dsp.destroySurfaceKHR(self.inst.handle, self.surface_khr, &vkutil.allocatorVulkanWrapper(&allocator));
-        if (build_options.vk_validation_layers) {
-            self.inst.dsp.destroyDebugUtilsMessengerEXT(self.inst.handle, self.debug_messenger, &vkutil.allocatorVulkanWrapper(&allocator));
+    pub fn deinit(self: *VkEngine, allocator: std.mem.Allocator) void {
+        const vk_allocator: ?*const vk.AllocationCallbacks = &vkutil.allocatorVulkanWrapper(&allocator);
+
+        for (self.swapchain_images.items(.view)) |view| {
+            self.device.dsp.destroyImageView(self.device.handle, view, vk_allocator);
         }
-        self.inst.dsp.destroyInstance(self.inst.handle, &vkutil.allocatorVulkanWrapper(&allocator));
+        self.swapchain_images.deinit(allocator);
+
+        self.device.dsp.destroySwapchainKHR(self.device.handle, self.swapchain_khr, vk_allocator);
+        self.device.dsp.destroyDevice(self.device.handle, vk_allocator);
+        self.inst.dsp.destroySurfaceKHR(self.inst.handle, self.surface_khr, vk_allocator);
+        if (build_options.vk_validation_layers) {
+            self.inst.dsp.destroyDebugUtilsMessengerEXT(self.inst.handle, self.debug_messenger, vk_allocator);
+        }
+        self.inst.dsp.destroyInstance(self.inst.handle, vk_allocator);
     }
 
-    pub fn getCoreDeviceQueue(self: VkEngine, comptime id: QueueFamilyId, index: u32) vk.Queue {
-        return self.device.dsp.getDeviceQueue(self.device.handle, @field(self.queue_family_indices, @tagName(id)), index);
+    pub fn getCoreDeviceQueue(self: VkEngine, comptime id: CoreQueueFamilyId, index: u32) vk.Queue {
+        return self.device.dsp.getDeviceQueue(self.device.handle, @field(self.core_qfi, @tagName(id)), index);
     }
 
     fn initVkInst(allocator: std.mem.Allocator, instanceProcLoader: anytype) !VkInst {
@@ -412,7 +480,7 @@ const VkEngine = struct {
 
         const desired_extensions: []const [:0]const u8 = try desiredInstanceExtensionNames(local_arena, [:0]const u8);
         const available_extensions: []const vk.ExtensionProperties = try vkutil.enumerateInstanceExtensionPropertiesAlloc(local_arena, bd, null);
-        const selected_extensions = switch (selectExtensionNames(allocator, available_extensions, [:0]const u8, desired_extensions)) {
+        const selected_extensions = switch (selectExtensionNames(local_arena, available_extensions, [:0]const u8, desired_extensions)) {
             .ok => |ok| ok,
             .err => |err| {
                 if (err.info.unavailable_extension) |unavailable_extension| {
@@ -556,8 +624,8 @@ const VkEngine = struct {
         dsp: InstanceDispatch,
         physical_device: vk.PhysicalDevice,
         surface_khr: vk.SurfaceKHR,
-    ) !QueueFamilyIndices {
-        var indices = std.EnumArray(QueueFamilyId, ?u32).initFill(null);
+    ) !CoreQueueFamilyIndices {
+        var indices = std.EnumArray(CoreQueueFamilyId, ?u32).initFill(null);
 
         const qfam_properties: []const vk.QueueFamilyProperties = try vkutil.getPhysicalDeviceQueueFamilyPropertiesAlloc(allocator, dsp, physical_device);
         defer allocator.free(qfam_properties);
@@ -595,8 +663,8 @@ const VkEngine = struct {
             break :log_qfamily_indices;
         }
 
-        var result: QueueFamilyIndices = undefined;
-        inline for (comptime std.enums.values(QueueFamilyId)) |tag| {
+        var result: CoreQueueFamilyIndices = undefined;
+        inline for (comptime std.enums.values(CoreQueueFamilyId)) |tag| {
             const tag_name = @tagName(tag);
             const title_case = [_]u8{std.ascii.toUpper(tag_name[0])} ++ tag_name[@boolToInt(tag_name.len >= 1)..];
             @field(result, @tagName(tag)) = indices.get(tag) orelse return @field(anyerror, "MissingFamilyQueueIndexFor" ++ title_case);
@@ -608,7 +676,7 @@ const VkEngine = struct {
         allocator: std.mem.Allocator,
         instance_dsp: InstanceDispatch,
         physical_device: vk.PhysicalDevice,
-        queue_family_indices: QueueFamilyIndices,
+        core_qfi: CoreQueueFamilyIndices,
     ) !VkDevice {
         const queue_create_infos: []const vk.DeviceQueueCreateInfo = queue_create_infos: {
             var queue_create_infos = std.ArrayList(vk.DeviceQueueCreateInfo).init(allocator);
@@ -616,14 +684,14 @@ const VkEngine = struct {
 
             try queue_create_infos.append(.{
                 .flags = .{},
-                .queue_family_index = queue_family_indices.graphics,
+                .queue_family_index = core_qfi.graphics,
                 .queue_count = 1,
                 .p_queue_priorities = std.mem.span(&[_]f32{1.0}).ptr,
             });
-            if (queue_family_indices.graphics != queue_family_indices.present) {
+            if (core_qfi.graphics != core_qfi.present) {
                 try queue_create_infos.append(.{
                     .flags = .{},
-                    .queue_family_index = queue_family_indices.present,
+                    .queue_family_index = core_qfi.present,
                     .queue_count = 1,
                     .p_queue_priorities = std.mem.span(&[_]f32{1.0}).ptr,
                 });
@@ -681,38 +749,6 @@ const VkEngine = struct {
             .handle = handle,
             .dsp = dsp,
         };
-    }
-
-    fn initSwapchain(allocator: std.mem.Allocator, device: VkDevice, qfi: QueueFamilyIndices, surface_khr: vk.SurfaceKHR, details: SwapchainDetails) !vk.SwapchainKHR {
-        const queue_family_indices: std.BoundedArray(u32, std.meta.fields(QueueFamilyIndices).len) = queue_family_indices: {
-            var queue_family_indices = std.BoundedArray(u32, std.meta.fields(QueueFamilyIndices).len).init(0) catch unreachable;
-            if (qfi.graphics != qfi.present) {
-                queue_family_indices.appendSlice(&.{ qfi.graphics, qfi.present }) catch unreachable;
-            }
-            break :queue_family_indices queue_family_indices;
-        };
-        const create_info = vk.SwapchainCreateInfoKHR{
-            .flags = vk.SwapchainCreateFlagsKHR{},
-            .surface = surface_khr,
-
-            .min_image_count = details.image_count,
-            .image_format = details.format.format,
-            .image_color_space = details.format.color_space,
-            .image_extent = details.extent,
-            .image_array_layers = 1,
-            .image_usage = vk.ImageUsageFlags{ .color_attachment_bit = true },
-
-            .image_sharing_mode = if (queue_family_indices.len > 1) .concurrent else .exclusive,
-            .queue_family_index_count = @intCast(u32, queue_family_indices.len),
-            .p_queue_family_indices = queue_family_indices.slice().ptr,
-
-            .pre_transform = details.capabilities.current_transform,
-            .composite_alpha = vk.CompositeAlphaFlagsKHR{ .opaque_bit_khr = true },
-            .present_mode = details.present_mode,
-            .clipped = vk.TRUE,
-            .old_swapchain = .null_handle,
-        };
-        return device.dsp.createSwapchainKHR(device.handle, &create_info, &vkutil.allocatorVulkanWrapper(&allocator));
     }
 
     const EnsureDesiredExtensionsAreAvailableResult = Result(
