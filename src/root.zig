@@ -49,6 +49,11 @@ const DeviceDispatch = vk.DeviceWrapper(vk.DeviceCommandFlags{
 
     .createImageView = true,
     .destroyImageView = true,
+
+    .createShaderModule = true,
+    .destroyShaderModule = true,
+    .createGraphicsPipelines = true,
+    .destroyPipeline = true,
 });
 
 fn getInstanceProcAddress(handle: vk.Instance, name: [*:0]const u8) ?*const anyopaque {
@@ -65,7 +70,7 @@ pub fn main() !void {
     try file_logger.init("vulkan-spincube.log", .{ .stderr_level = .err }, &.{.gpa});
     defer file_logger.deinit();
 
-    var gpa = if (builtin.mode == .Debug) std.heap.GeneralPurposeAllocator(.{ .verbose_log = true, .stack_trace_frames = 8 }){};
+    var gpa = if (builtin.mode == .Debug) std.heap.GeneralPurposeAllocator(.{ .verbose_log = false, .stack_trace_frames = 8 }){};
     defer if (builtin.mode == .Debug) {
         _ = gpa.deinit();
     };
@@ -84,9 +89,121 @@ pub fn main() !void {
     _ = vk_context.getCoreDeviceQueue(.present, 0);
     _ = vk_context.getCoreDeviceQueue(.graphics, 0);
 
+    const graphics_pipeline = try createGraphicsPipeline(allocator, vk_context.device, vk_context.swapchain.details);
+    defer vk_context.device.dsp.destroyPipeline(vk_context.device.handle, graphics_pipeline, &vkutil.allocatorVulkanWrapper(&allocator));
+
     while (!window.shouldClose()) {
         try glfw.pollEvents();
     }
+}
+
+fn createGraphicsPipeline(allocator: std.mem.Allocator, device: VulkanContext.VulkanDevice, swapchain_details: VulkanContext.SwapchainDetails) !vk.Pipeline {
+    const vk_allocator: ?*const vk.AllocationCallbacks = &vkutil.allocatorVulkanWrapper(&allocator);
+
+    const vert_shader_module: vk.ShaderModule = try device.dsp.createShaderModule(device.handle, &vk.ShaderModuleCreateInfo{
+        .flags = .{},
+        .code_size = shader_bytecode.vert.len,
+        .p_code = @ptrCast([*]const u32, shader_bytecode.vert),
+    }, vk_allocator);
+    defer device.dsp.destroyShaderModule(device.handle, vert_shader_module, vk_allocator);
+
+    const frag_shader_module: vk.ShaderModule = try device.dsp.createShaderModule(device.handle, &vk.ShaderModuleCreateInfo{
+        .flags = .{},
+        .code_size = shader_bytecode.frag.len,
+        .p_code = @ptrCast([*]const u32, shader_bytecode.frag),
+    }, vk_allocator);
+    defer device.dsp.destroyShaderModule(device.handle, frag_shader_module, vk_allocator);
+
+    const shader_stage_create_infos = [_]vk.PipelineShaderStageCreateInfo{
+        .{ // vert stage
+            .flags = .{},
+            .stage = vk.ShaderStageFlags{ .vertex_bit = true },
+            .module = vert_shader_module,
+            .p_name = "main",
+            .p_specialization_info = null,
+        },
+        .{ // frag stage
+            .flags = .{},
+            .stage = vk.ShaderStageFlags{ .fragment_bit = true },
+            .module = frag_shader_module,
+            .p_name = "main",
+            .p_specialization_info = null,
+        },
+    };
+
+    const viewports = [_]vk.Viewport{
+        .{
+            .x = 0.0,
+            .y = 0.0,
+            .width = @intToFloat(f32, swapchain_details.extent.width),
+            .height = @intToFloat(f32, swapchain_details.extent.height),
+            .min_depth = 0.0,
+            .max_depth = 0.0,
+        },
+    };
+
+    const scissors = [_]vk.Rect2D{
+        .{
+            .offset = vk.Offset2D{ .x = 0, .y = 0 },
+            .extent = swapchain_details.extent,
+        },
+    };
+
+    const graphics_pipeline_create_info = vk.GraphicsPipelineCreateInfo{
+        .flags = vk.PipelineCreateFlags{},
+        .stage_count = @intCast(u32, shader_stage_create_infos.len),
+        .p_stages = &shader_stage_create_infos,
+        .p_vertex_input_state = &vk.PipelineVertexInputStateCreateInfo{
+            .flags = .{},
+
+            .vertex_binding_description_count = 0,
+            .p_vertex_binding_descriptions = std.mem.span(&[_]vk.VertexInputBindingDescription{}).ptr,
+
+            .vertex_attribute_description_count = 0,
+            .p_vertex_attribute_descriptions = std.mem.span(&[_]vk.VertexInputAttributeDescription{}).ptr,
+        },
+        .p_input_assembly_state = &vk.PipelineInputAssemblyStateCreateInfo{
+            .flags = .{},
+            .topology = vk.PrimitiveTopology.triangle_list,
+            .primitive_restart_enable = vk.FALSE,
+        },
+        .p_tessellation_state = null,
+        .p_viewport_state = &vk.PipelineViewportStateCreateInfo{
+            .flags = .{},
+
+            .viewport_count = @intCast(u32, viewports.len),
+            .p_viewports = &viewports,
+
+            .scissor_count = @intCast(u32, scissors.len),
+            .p_scissors = &scissors,
+        },
+        .p_rasterization_state = null,
+        .p_multisample_state = null,
+        .p_depth_stencil_state = null,
+        .p_color_blend_state = null,
+        .p_dynamic_state = null,
+        .layout = .null_handle,
+        .render_pass = .null_handle,
+        .subpass = 0,
+        .base_pipeline_handle = .null_handle,
+        .base_pipeline_index = 0,
+    };
+
+    var pipelines: [1]vk.Pipeline = undefined;
+    if (device.dsp.createGraphicsPipelines(
+        device.handle,
+        .null_handle,
+        @intCast(u32, 1),
+        &[_]vk.GraphicsPipelineCreateInfo{graphics_pipeline_create_info},
+        vk_allocator,
+        &pipelines,
+    )) |result| switch (result) {
+        .success => {},
+        .pipeline_compile_required => unreachable, // ?
+        else => unreachable,
+    } else |err| return err;
+
+    return pipelines[0];
 }
 
 const VulkanContext = struct {
@@ -94,7 +211,7 @@ const VulkanContext = struct {
     debug_messenger: if (build_options.vk_validation_layers) vk.DebugUtilsMessengerEXT else void,
     physical_device: vk.PhysicalDevice,
     core_qfi: CoreQueueFamilyIndices,
-    device: VkDevice,
+    device: VulkanDevice,
     surface_khr: vk.SurfaceKHR,
     swapchain: Swapchain,
 
@@ -336,7 +453,7 @@ const VulkanContext = struct {
     }
 
     const VulkanInst = struct { handle: vk.Instance, dsp: InstanceDispatch };
-    const VkDevice = struct { handle: vk.Device, dsp: DeviceDispatch };
+    const VulkanDevice = struct { handle: vk.Device, dsp: DeviceDispatch };
     const ImageHandleViewPair = struct { img: vk.Image, view: vk.ImageView };
 
     const CoreQueueFamilyId = std.meta.FieldEnum(CoreQueueFamilyIndices);
@@ -741,7 +858,7 @@ const VulkanContext = struct {
         instance_dsp: InstanceDispatch,
         physical_device: vk.PhysicalDevice,
         core_qfi: CoreQueueFamilyIndices,
-    ) !VkDevice {
+    ) !VulkanDevice {
         const queue_create_infos: []const vk.DeviceQueueCreateInfo = queue_create_infos: {
             var queue_create_infos = std.ArrayList(vk.DeviceQueueCreateInfo).init(allocator);
             errdefer queue_create_infos.deinit();
@@ -809,15 +926,11 @@ const VulkanContext = struct {
         };
         errdefer dsp.destroyDevice(handle, &vkutil.allocatorVulkanWrapper(&allocator));
 
-        return VkDevice{
+        return VulkanDevice{
             .handle = handle,
             .dsp = dsp,
         };
     }
-};
-
-const VulkanGraphicsPipeline = struct {
-    //
 };
 
 pub const ResultTag = enum { ok, err };
