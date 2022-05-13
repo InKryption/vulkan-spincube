@@ -27,6 +27,18 @@ pub fn build(b: *std.build.Builder) void {
     mach.glfw.link(b, exe, mach.glfw.Options{ .vulkan = true });
     exe.addPackage(mach.glfw.pkg);
 
+    const vk_shader_compile_step = vk.ShaderCompileStep.init(b, &.{"glslc"}, "shader-bytecode");
+    exe.step.dependOn(&vk_shader_compile_step.step);
+    {
+        const shader_frag = vk_shader_compile_step.add("src/shader.frag");
+        const shader_vert = vk_shader_compile_step.add("src/shader.vert");
+
+        const shader_byte_code_paths = b.addOptions();
+        exe.addOptions("shader-bytecodes", shader_byte_code_paths);
+        shader_byte_code_paths.contents.writer().print("pub const frag = @embedFile(\"{s}\");\n", .{shader_frag}) catch unreachable;
+        shader_byte_code_paths.contents.writer().print("pub const vert = @embedFile(\"{s}\");\n", .{shader_vert}) catch unreachable;
+    }
+
     const run_cmd = exe.run();
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| {

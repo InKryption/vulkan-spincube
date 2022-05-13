@@ -1,9 +1,11 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const build_options = @import("build_options");
 const glfw = @import("glfw");
 const vk = @import("vulkan");
 const vkutil = @import("vkutil.zig");
+
+const build_options = @import("build_options");
+const shader_bytecode = @import("shader-bytecodes");
 
 const BaseDispatch = vk.BaseWrapper(vk.BaseCommandFlags{
     .createInstance = true,
@@ -812,6 +814,10 @@ const VulkanContext = struct {
             .dsp = dsp,
         };
     }
+};
+
+const VulkanGraphicsPipeline = struct {
+    //
 };
 
 pub const ResultTag = enum { ok, err };
