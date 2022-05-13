@@ -412,7 +412,15 @@ const VkEngine = struct {
 
         const desired_extensions: []const [:0]const u8 = try desiredInstanceExtensionNames(local_arena, [:0]const u8);
         const available_extensions: []const vk.ExtensionProperties = try vkutil.enumerateInstanceExtensionPropertiesAlloc(local_arena, bd, null);
-        const selected_extensions = try selectExtensionNames(allocator, available_extensions, [:0]const u8, desired_extensions).unwrap();
+        const selected_extensions = switch (selectExtensionNames(allocator, available_extensions, [:0]const u8, desired_extensions)) {
+            .ok => |ok| ok,
+            .err => |err| {
+                if (err.info.unavailable_extension) |unavailable_extension| {
+                    std.log.err("Instance extension '{s}' not found/not available.", .{unavailable_extension});
+                }
+                return err.code;
+            },
+        };
 
         log_layers_and_extensions: {
             var log_buff = std.ArrayList(u8).init(local_arena);
@@ -631,7 +639,15 @@ const VkEngine = struct {
         const available_extensions = try vkutil.enumerateDeviceExtensionPropertiesAlloc(allocator, instance_dsp, physical_device);
         defer allocator.free(available_extensions);
 
-        const selected_extensions = try selectExtensionNames(allocator, available_extensions, [:0]const u8, desired_extensions).unwrap();
+        const selected_extensions = switch (selectExtensionNames(allocator, available_extensions, [:0]const u8, desired_extensions)) {
+            .ok => |ok| ok,
+            .err => |err| {
+                if (err.info.unavailable_extension) |unavailable_extension| {
+                    std.log.err("Device extension '{s}' not found/not available.", .{unavailable_extension});
+                }
+                return err.code;
+            },
+        };
         defer {
             var copy = selected_extensions;
             copy.deinit(allocator);
