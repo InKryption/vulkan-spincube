@@ -59,103 +59,8 @@ const file_logger = @import("file_logger.zig");
 pub const log = file_logger.log;
 pub const log_level: std.log.Level = @field(std.log.Level, @tagName(build_options.log_level));
 
-const debug_utils_messenger_create_info_ext = vk.DebugUtilsMessengerCreateInfoEXT{
-    .flags = vk.DebugUtilsMessengerCreateFlagsEXT{},
-    .message_severity = vk.DebugUtilsMessageSeverityFlagsEXT{
-        .verbose_bit_ext = true,
-        .info_bit_ext = true,
-        .warning_bit_ext = true,
-        .error_bit_ext = true,
-    },
-    .message_type = vk.DebugUtilsMessageTypeFlagsEXT{
-        .general_bit_ext = true,
-        .validation_bit_ext = true,
-        .performance_bit_ext = true,
-    },
-    .pfn_user_callback = vulkanDebugMessengerCallback,
-    .p_user_data = null,
-};
-fn vulkanDebugMessengerCallback(
-    msg_severity_int: vk.DebugUtilsMessageSeverityFlagsEXT.IntType,
-    message_types: vk.DebugUtilsMessageTypeFlagsEXT.IntType,
-    opt_p_callback_data: ?*const vk.DebugUtilsMessengerCallbackDataEXT,
-    p_user_data: ?*anyopaque,
-) callconv(vk.vulkan_call_conv) vk.Bool32 {
-    _ = message_types;
-    _ = p_user_data;
-
-    const logger = std.log.scoped(.vk_messenger);
-    const msg_severity = @bitCast(vk.DebugUtilsMessageSeverityFlagsEXT, msg_severity_int);
-    const level: std.log.Level = if (msg_severity.error_bit_ext)
-        .err
-    else if (msg_severity.warning_bit_ext)
-        .warn
-    else if (msg_severity.info_bit_ext) .info else std.log.Level.debug;
-
-    const p_callback_data = opt_p_callback_data orelse return vk.FALSE;
-    switch (level) {
-        .err => logger.err("{s}", .{p_callback_data.p_message}),
-        .warn => logger.warn("{s}", .{p_callback_data.p_message}),
-        .info => logger.info("{s}", .{p_callback_data.p_message}),
-        .debug => logger.debug("{s}", .{p_callback_data.p_message}),
-    }
-
-    return vk.FALSE;
-}
-
-fn desiredInstanceLayerNames(allocator: std.mem.Allocator, comptime StrType: type) ![]const StrType {
-    comptime std.debug.assert(
-        std.meta.trait.isSlice(StrType) and
-            std.meta.trait.isZigString(StrType),
-    );
-    comptime if (!build_options.vk_validation_layers) return &.{};
-
-    var result = std.ArrayList(StrType).init(allocator);
-    errdefer freeSliceOfStrings(allocator, StrType, result.toOwnedSlice());
-
-    try result.append(try allocator.dupeZ(u8, "VK_LAYER_KHRONOS_validation"));
-
-    return result.toOwnedSlice();
-}
-fn desiredInstanceExtensionNames(allocator: std.mem.Allocator, comptime StrType: type) ![]const StrType {
-    comptime std.debug.assert(
-        std.meta.trait.isSlice(StrType) and
-            std.meta.trait.isZigString(StrType),
-    );
-
-    var result = std.ArrayList(StrType).init(allocator);
-    errdefer freeSliceOfStrings(allocator, StrType, result.toOwnedSlice());
-
-    const glfw_required_extensions = try glfw.getRequiredInstanceExtensions();
-    try result.ensureUnusedCapacity(glfw_required_extensions.len);
-    for (glfw_required_extensions) |p_ext_name| {
-        const ext_name = std.mem.span(p_ext_name);
-        result.appendAssumeCapacity(try allocator.dupeZ(u8, ext_name));
-    }
-
-    if (build_options.vk_validation_layers) {
-        try result.append(try allocator.dupeZ(u8, vk.extension_info.ext_debug_utils.name));
-    }
-
-    return result.toOwnedSlice();
-}
-
-fn desiredDeviceExtensionNames(allocator: std.mem.Allocator, comptime StrType: type) ![]const StrType {
-    comptime std.debug.assert(
-        std.meta.trait.isSlice(StrType) and
-            std.meta.trait.isZigString(StrType),
-    );
-
-    var result = std.ArrayList(StrType).init(allocator);
-    errdefer freeSliceOfStrings(allocator, StrType, result.toOwnedSlice());
-
-    try result.append(try allocator.dupeZ(u8, vk.extension_info.khr_swapchain.name));
-
-    return result.toOwnedSlice();
-}
-
 pub fn main() !void {
-    try file_logger.init("vulkan-spincube.log", .{ .stderr_level = .err }, &.{ .gpa });
+    try file_logger.init("vulkan-spincube.log", .{ .stderr_level = .err }, &.{.gpa});
     defer file_logger.deinit();
 
     var gpa = if (builtin.mode == .Debug) std.heap.GeneralPurposeAllocator(.{ .verbose_log = true, .stack_trace_frames = 8 }){};
@@ -171,52 +76,38 @@ pub fn main() !void {
     const window = try glfw.Window.create(100, 100, "vulkan-spincube", null, null, glfw.Window.Hints{ .client_api = .no_api });
     defer window.destroy();
 
-    var engine = try VkEngine.init(allocator, getInstanceProcAddress, window);
-    defer engine.deinit(allocator);
+    var vk_context = try VulkanContext.init(allocator, getInstanceProcAddress, window);
+    defer vk_context.deinit(allocator);
 
-    _ = engine.getCoreDeviceQueue(.present, 0);
-    _ = engine.getCoreDeviceQueue(.graphics, 0);
+    _ = vk_context.getCoreDeviceQueue(.present, 0);
+    _ = vk_context.getCoreDeviceQueue(.graphics, 0);
 
     while (!window.shouldClose()) {
         try glfw.pollEvents();
     }
 }
 
-const VkEngine = struct {
-    inst: VkInst,
+const VulkanContext = struct {
+    inst: VulkanInst,
     debug_messenger: if (build_options.vk_validation_layers) vk.DebugUtilsMessengerEXT else void,
     physical_device: vk.PhysicalDevice,
     core_qfi: CoreQueueFamilyIndices,
     device: VkDevice,
     surface_khr: vk.SurfaceKHR,
-    swapchain_details: SwapchainDetails,
-    swapchain_khr: vk.SwapchainKHR,
-    swapchain_images: std.MultiArrayList(ImageHandleViewPair).Slice,
+    swapchain: Swapchain,
 
-    const VkInst = struct { handle: vk.Instance, dsp: InstanceDispatch };
-    const VkDevice = struct { handle: vk.Device, dsp: DeviceDispatch };
-    const ImageHandleViewPair = struct { img: vk.Image, view: vk.ImageView };
-
-    const CoreQueueFamilyId = std.meta.FieldEnum(CoreQueueFamilyIndices);
-    const CoreQueueFamilyIndices = struct {
-        graphics: u32,
-        present: u32,
-    };
-
-    const SwapchainDetails = struct {
-        capabilities: vk.SurfaceCapabilitiesKHR,
-        format: vk.SurfaceFormatKHR,
-        present_mode: vk.PresentModeKHR,
-        extent: vk.Extent2D,
-        image_count: u32,
+    const Swapchain = struct {
+        details: SwapchainDetails,
+        handle: vk.SwapchainKHR,
+        images: std.MultiArrayList(ImageHandleViewPair).Slice,
     };
 
     pub fn init(
         allocator: std.mem.Allocator,
         instanceProcLoader: anytype,
         window: glfw.Window,
-    ) !VkEngine {
-        const inst: VkInst = try initVkInst(allocator, instanceProcLoader);
+    ) !VulkanContext {
+        const inst: VulkanInst = try initVulkanInst(allocator, instanceProcLoader);
         errdefer inst.dsp.destroyInstance(inst.handle, &vkutil.allocatorVulkanWrapper(&allocator));
 
         const debug_messenger = if (build_options.vk_validation_layers)
@@ -407,27 +298,29 @@ const VkEngine = struct {
             copy.deinit(allocator);
         }
 
-        return VkEngine{
+        return VulkanContext{
             .inst = inst,
             .debug_messenger = debug_messenger,
             .physical_device = physical_device,
             .core_qfi = core_qfi,
             .device = device,
             .surface_khr = surface_khr,
-            .swapchain_details = swapchain_details,
-            .swapchain_khr = swapchain_khr,
-            .swapchain_images = swapchain_images,
+            .swapchain = .{
+                .details = swapchain_details,
+                .handle = swapchain_khr,
+                .images = swapchain_images,
+            },
         };
     }
-    pub fn deinit(self: *VkEngine, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *VulkanContext, allocator: std.mem.Allocator) void {
         const vk_allocator: ?*const vk.AllocationCallbacks = &vkutil.allocatorVulkanWrapper(&allocator);
 
-        for (self.swapchain_images.items(.view)) |view| {
+        for (self.swapchain.images.items(.view)) |view| {
             self.device.dsp.destroyImageView(self.device.handle, view, vk_allocator);
         }
-        self.swapchain_images.deinit(allocator);
+        self.swapchain.images.deinit(allocator);
 
-        self.device.dsp.destroySwapchainKHR(self.device.handle, self.swapchain_khr, vk_allocator);
+        self.device.dsp.destroySwapchainKHR(self.device.handle, self.swapchain.handle, vk_allocator);
         self.device.dsp.destroyDevice(self.device.handle, vk_allocator);
         self.inst.dsp.destroySurfaceKHR(self.inst.handle, self.surface_khr, vk_allocator);
         if (build_options.vk_validation_layers) {
@@ -436,11 +329,180 @@ const VkEngine = struct {
         self.inst.dsp.destroyInstance(self.inst.handle, vk_allocator);
     }
 
-    pub fn getCoreDeviceQueue(self: VkEngine, comptime id: CoreQueueFamilyId, index: u32) vk.Queue {
+    pub fn getCoreDeviceQueue(self: VulkanContext, comptime id: CoreQueueFamilyId, index: u32) vk.Queue {
         return self.device.dsp.getDeviceQueue(self.device.handle, @field(self.core_qfi, @tagName(id)), index);
     }
 
-    fn initVkInst(allocator: std.mem.Allocator, instanceProcLoader: anytype) !VkInst {
+    const VulkanInst = struct { handle: vk.Instance, dsp: InstanceDispatch };
+    const VkDevice = struct { handle: vk.Device, dsp: DeviceDispatch };
+    const ImageHandleViewPair = struct { img: vk.Image, view: vk.ImageView };
+
+    const CoreQueueFamilyId = std.meta.FieldEnum(CoreQueueFamilyIndices);
+    const CoreQueueFamilyIndices = struct {
+        graphics: u32,
+        present: u32,
+    };
+
+    const SwapchainDetails = struct {
+        capabilities: vk.SurfaceCapabilitiesKHR,
+        format: vk.SurfaceFormatKHR,
+        present_mode: vk.PresentModeKHR,
+        extent: vk.Extent2D,
+        image_count: u32,
+    };
+
+    const debug_utils_messenger_create_info_ext = vk.DebugUtilsMessengerCreateInfoEXT{
+        .flags = vk.DebugUtilsMessengerCreateFlagsEXT{},
+        .message_severity = vk.DebugUtilsMessageSeverityFlagsEXT{
+            .verbose_bit_ext = true,
+            .info_bit_ext = true,
+            .warning_bit_ext = true,
+            .error_bit_ext = true,
+        },
+        .message_type = vk.DebugUtilsMessageTypeFlagsEXT{
+            .general_bit_ext = true,
+            .validation_bit_ext = true,
+            .performance_bit_ext = true,
+        },
+        .pfn_user_callback = vulkanDebugMessengerCallback,
+        .p_user_data = null,
+    };
+    fn vulkanDebugMessengerCallback(
+        msg_severity_int: vk.DebugUtilsMessageSeverityFlagsEXT.IntType,
+        message_types: vk.DebugUtilsMessageTypeFlagsEXT.IntType,
+        opt_p_callback_data: ?*const vk.DebugUtilsMessengerCallbackDataEXT,
+        p_user_data: ?*anyopaque,
+    ) callconv(vk.vulkan_call_conv) vk.Bool32 {
+        _ = message_types;
+        _ = p_user_data;
+
+        const logger = std.log.scoped(.vk_messenger);
+        const msg_severity = @bitCast(vk.DebugUtilsMessageSeverityFlagsEXT, msg_severity_int);
+        const level: std.log.Level = if (msg_severity.error_bit_ext)
+            .err
+        else if (msg_severity.warning_bit_ext)
+            .warn
+        else if (msg_severity.info_bit_ext) .info else std.log.Level.debug;
+
+        const p_callback_data = opt_p_callback_data orelse return vk.FALSE;
+        switch (level) {
+            .err => logger.err("{s}", .{p_callback_data.p_message}),
+            .warn => logger.warn("{s}", .{p_callback_data.p_message}),
+            .info => logger.info("{s}", .{p_callback_data.p_message}),
+            .debug => logger.debug("{s}", .{p_callback_data.p_message}),
+        }
+
+        return vk.FALSE;
+    }
+
+    fn desiredInstanceLayerNames(allocator: std.mem.Allocator, comptime StrType: type) ![]const StrType {
+        comptime std.debug.assert(
+            std.meta.trait.isSlice(StrType) and
+                std.meta.trait.isZigString(StrType),
+        );
+        comptime if (!build_options.vk_validation_layers) return &.{};
+
+        var result = std.ArrayList(StrType).init(allocator);
+        errdefer freeSliceOfStrings(allocator, StrType, result.toOwnedSlice());
+
+        try result.append(try allocator.dupeZ(u8, "VK_LAYER_KHRONOS_validation"));
+
+        return result.toOwnedSlice();
+    }
+    fn desiredInstanceExtensionNames(allocator: std.mem.Allocator, comptime StrType: type) ![]const StrType {
+        comptime std.debug.assert(
+            std.meta.trait.isSlice(StrType) and
+                std.meta.trait.isZigString(StrType),
+        );
+
+        var result = std.ArrayList(StrType).init(allocator);
+        errdefer freeSliceOfStrings(allocator, StrType, result.toOwnedSlice());
+
+        const glfw_required_extensions = try glfw.getRequiredInstanceExtensions();
+        try result.ensureUnusedCapacity(glfw_required_extensions.len);
+        for (glfw_required_extensions) |p_ext_name| {
+            const ext_name = std.mem.span(p_ext_name);
+            result.appendAssumeCapacity(try allocator.dupeZ(u8, ext_name));
+        }
+
+        if (build_options.vk_validation_layers) {
+            try result.append(try allocator.dupeZ(u8, vk.extension_info.ext_debug_utils.name));
+        }
+
+        return result.toOwnedSlice();
+    }
+
+    fn desiredDeviceExtensionNames(allocator: std.mem.Allocator, comptime StrType: type) ![]const StrType {
+        comptime std.debug.assert(
+            std.meta.trait.isSlice(StrType) and
+                std.meta.trait.isZigString(StrType),
+        );
+
+        var result = std.ArrayList(StrType).init(allocator);
+        errdefer freeSliceOfStrings(allocator, StrType, result.toOwnedSlice());
+
+        try result.append(try allocator.dupeZ(u8, vk.extension_info.khr_swapchain.name));
+
+        return result.toOwnedSlice();
+    }
+    const EnsureDesiredExtensionsAreAvailableResult = Result(
+        std.ArrayHashMapUnmanaged([*:0]const u8, void, ArrayHashMapStringZContext, true),
+        std.mem.Allocator.Error || error{ExtensionUnavailable},
+        struct {
+            unavailable_extension: ?[:0]const u8 = null,
+        },
+    );
+    fn selectExtensionNames(
+        allocator: std.mem.Allocator,
+        /// Pointers to these will be referenced by the result, therefore
+        /// must have a lifetime equal to, or greater than the output.
+        available_extensions: []const vk.ExtensionProperties,
+        comptime InputStrType: type,
+        desired_extensions: []const InputStrType,
+    ) EnsureDesiredExtensionsAreAvailableResult {
+        const Res = EnsureDesiredExtensionsAreAvailableResult;
+        comptime std.debug.assert(
+            std.meta.trait.isSlice(InputStrType) and
+                std.meta.trait.isZigString(InputStrType),
+        );
+        const available_extension_set: StringZHashSet.Unmanaged = available_extension_set: {
+            var available_extension_set = StringZHashSet.init(allocator);
+
+            available_extension_set.ensureUnusedCapacity(@intCast(StringZHashSet.Size, available_extensions.len)) catch |err| {
+                available_extension_set.deinit();
+                return Res.initError(err, .{});
+            };
+            for (available_extensions) |*ext| {
+                const str = std.meta.assumeSentinel(std.mem.sliceTo(std.mem.span(&ext.extension_name), 0), 0);
+                available_extension_set.putAssumeCapacityNoClobber(str, {});
+            }
+
+            break :available_extension_set available_extension_set.unmanaged;
+        };
+        defer {
+            var copy = available_extension_set;
+            copy.deinit(allocator);
+        }
+
+        var selected_extensions = std.ArrayHashMap([*:0]const u8, void, ArrayHashMapStringZContext, true).init(allocator);
+
+        selected_extensions.ensureUnusedCapacity(desired_extensions.len) catch |err| {
+            selected_extensions.deinit();
+            return Res.initError(err, .{});
+        };
+        for (desired_extensions) |p_desired_extension| {
+            const desired_extension = std.mem.span(p_desired_extension);
+            if (available_extension_set.getKey(desired_extension)) |str| {
+                selected_extensions.putAssumeCapacityNoClobber(str.ptr, {});
+            } else {
+                return Res.initError(error.ExtensionUnavailable, .{ .unavailable_extension = desired_extension });
+            }
+        }
+
+        return Res.initOk(selected_extensions.unmanaged);
+    }
+
+    fn initVulkanInst(allocator: std.mem.Allocator, instanceProcLoader: anytype) !VulkanInst {
         var local_arena_state = std.heap.ArenaAllocator.init(allocator);
         defer local_arena_state.deinit();
 
@@ -461,8 +523,8 @@ const VkEngine = struct {
 
             break :available_layer_set available_layer_set.unmanaged;
         };
-        const selected_layers: std.ArrayHashMapUnmanaged([*:0]const u8, void, ArrayCStringContext, true) = selected_layers: {
-            var selected_layers = std.ArrayHashMap([*:0]const u8, void, ArrayCStringContext, true).init(local_arena);
+        const selected_layers: std.ArrayHashMapUnmanaged([*:0]const u8, void, ArrayHashMapStringZContext, true) = selected_layers: {
+            var selected_layers = std.ArrayHashMap([*:0]const u8, void, ArrayHashMapStringZContext, true).init(local_arena);
             errdefer selected_layers.deinit();
 
             try selected_layers.ensureUnusedCapacity(desired_layers.len);
@@ -575,13 +637,13 @@ const VkEngine = struct {
         };
         errdefer dsp.destroyInstance(handle, &vkutil.allocatorVulkanWrapper(&allocator));
 
-        return VkInst{
+        return VulkanInst{
             .handle = handle,
             .dsp = dsp,
         };
     }
 
-    fn createVkDebugMessenger(allocator: std.mem.Allocator, inst: VkInst) !vk.DebugUtilsMessengerEXT {
+    fn createVkDebugMessenger(allocator: std.mem.Allocator, inst: VulkanInst) !vk.DebugUtilsMessengerEXT {
         return inst.dsp.createDebugUtilsMessengerEXT(inst.handle, &vk.DebugUtilsMessengerCreateInfoEXT{
             .flags = vk.DebugUtilsMessengerCreateFlagsEXT{},
             .message_severity = vk.DebugUtilsMessageSeverityFlagsEXT{
@@ -599,11 +661,11 @@ const VkEngine = struct {
             .p_user_data = null,
         }, &vkutil.allocatorVulkanWrapper(&allocator));
     }
-    fn destroyVkDebugMessenger(allocator: std.mem.Allocator, inst: VkInst, debug_messenger: vk.DebugUtilsMessengerEXT) void {
+    fn destroyVkDebugMessenger(allocator: std.mem.Allocator, inst: VulkanInst, debug_messenger: vk.DebugUtilsMessengerEXT) void {
         inst.dsp.destroyDebugUtilsMessengerEXT(inst.handle, debug_messenger, &vkutil.allocatorVulkanWrapper(&allocator));
     }
 
-    fn selectPhysicalDevice(allocator: std.mem.Allocator, inst: VkInst) !vk.PhysicalDevice {
+    fn selectPhysicalDevice(allocator: std.mem.Allocator, inst: VulkanInst) !vk.PhysicalDevice {
         const physical_devices = try vkutil.enumeratePhysicalDevicesAlloc(allocator, inst.dsp, inst.handle);
         defer allocator.free(physical_devices);
 
@@ -750,73 +812,6 @@ const VkEngine = struct {
             .dsp = dsp,
         };
     }
-
-    const EnsureDesiredExtensionsAreAvailableResult = Result(
-        std.ArrayHashMapUnmanaged([*:0]const u8, void, ArrayCStringContext, true),
-        std.mem.Allocator.Error || error{ExtensionUnavailable},
-        struct {
-            unavailable_extension: ?[:0]const u8 = null,
-        },
-    );
-    fn selectExtensionNames(
-        allocator: std.mem.Allocator,
-        /// Pointers to these will be referenced by the result, therefore
-        /// must have a lifetime equal to, or greater than the output.
-        available_extensions: []const vk.ExtensionProperties,
-        comptime InputStrType: type,
-        desired_extensions: []const InputStrType,
-    ) EnsureDesiredExtensionsAreAvailableResult {
-        const Res = EnsureDesiredExtensionsAreAvailableResult;
-        comptime std.debug.assert(
-            std.meta.trait.isSlice(InputStrType) and
-                std.meta.trait.isZigString(InputStrType),
-        );
-        const StringZHashMap = std.HashMap([:0]const u8, void, struct {
-            pub fn hash(ctx: @This(), str: [:0]const u8) u64 {
-                _ = ctx;
-                return std.hash_map.StringContext.hash(.{}, str);
-            }
-            pub fn eql(ctx: @This(), a: [:0]const u8, b: [:0]const u8) bool {
-                _ = ctx;
-                return std.hash_map.StringContext.eql(.{}, a, b);
-            }
-        }, std.hash_map.default_max_load_percentage);
-        const available_extension_set: StringZHashMap.Unmanaged = available_extension_set: {
-            var available_extension_set = StringZHashMap.init(allocator);
-
-            available_extension_set.ensureUnusedCapacity(@intCast(StringZHashMap.Size, available_extensions.len)) catch |err| {
-                available_extension_set.deinit();
-                return Res.initError(err, .{});
-            };
-            for (available_extensions) |*ext| {
-                const str = std.meta.assumeSentinel(std.mem.sliceTo(std.mem.span(&ext.extension_name), 0), 0);
-                available_extension_set.putAssumeCapacityNoClobber(str, {});
-            }
-
-            break :available_extension_set available_extension_set.unmanaged;
-        };
-        defer {
-            var copy = available_extension_set;
-            copy.deinit(allocator);
-        }
-
-        var selected_extensions = std.ArrayHashMap([*:0]const u8, void, ArrayCStringContext, true).init(allocator);
-
-        selected_extensions.ensureUnusedCapacity(desired_extensions.len) catch |err| {
-            selected_extensions.deinit();
-            return Res.initError(err, .{});
-        };
-        for (desired_extensions) |p_desired_extension| {
-            const desired_extension = std.mem.span(p_desired_extension);
-            if (available_extension_set.getKey(desired_extension)) |str| {
-                selected_extensions.putAssumeCapacityNoClobber(str.ptr, {});
-            } else {
-                return Res.initError(error.ExtensionUnavailable, .{ .unavailable_extension = desired_extension });
-            }
-        }
-
-        return Res.initOk(selected_extensions.unmanaged);
-    }
 };
 
 pub const ResultTag = enum { ok, err };
@@ -859,7 +854,7 @@ pub fn Result(
     };
 }
 
-const ArrayCStringContext = struct {
+const ArrayHashMapStringZContext = struct {
     pub fn hash(ctx: @This(), p_str: [*:0]const u8) u32 {
         _ = ctx;
         return std.array_hash_map.StringContext.hash(.{}, std.mem.span(p_str));
@@ -869,6 +864,35 @@ const ArrayCStringContext = struct {
         return std.array_hash_map.StringContext.eql(.{}, std.mem.span(a), std.mem.span(b), b_index);
     }
 };
+const HashMapStringZContext = struct {
+    pub fn hash(ctx: @This(), key: [*:0]const u8) u64 {
+        _ = ctx;
+        return std.hash_map.StringContext.hash(.{}, std.mem.span(key));
+    }
+    pub fn eql(ctx: @This(), a: [*:0]const u8, b: [*:0]const u8) bool {
+        _ = ctx;
+        if (a == b) return true;
+
+        var len: usize = 0;
+        while (true) : (len += 1) {
+            if (a[len] != b[len]) return false;
+            if (a[len] == 0) break;
+        }
+
+        return true;
+    }
+};
+
+const StringZHashSet = std.HashMap([:0]const u8, void, struct {
+    pub fn hash(ctx: @This(), str: [:0]const u8) u64 {
+        _ = ctx;
+        return std.hash_map.StringContext.hash(.{}, str);
+    }
+    pub fn eql(ctx: @This(), a: [:0]const u8, b: [:0]const u8) bool {
+        _ = ctx;
+        return std.hash_map.StringContext.eql(.{}, a, b);
+    }
+}, std.hash_map.default_max_load_percentage);
 
 fn freeSliceOfStrings(allocator: std.mem.Allocator, comptime StrType: type, extension_names: []const StrType) void {
     for (extension_names) |p_ext_name| {
