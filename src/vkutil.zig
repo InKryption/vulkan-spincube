@@ -73,7 +73,7 @@ const allocation_wrapper = struct {
 
         if (size == 0) return null;
 
-        const bytes = allocator.allocBytes(@intCast(u29, alignment), @sizeOf(Metadata) + size, 0, @returnAddress()) catch return null;
+        const bytes = allocator.rawAlloc(@sizeOf(Metadata) + size, @intCast(u29, alignment), 0, @returnAddress()) catch return null;
         std.mem.bytesAsValue(Metadata, bytes[0..@sizeOf(Metadata)]).* = .{
             .len = size,
             .alignment = @intCast(u29, alignment),
