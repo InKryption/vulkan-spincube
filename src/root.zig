@@ -410,34 +410,9 @@ const VkEngine = struct {
             break :selected_layers selected_layers.unmanaged;
         };
 
-        const desired_extensions = try desiredInstanceExtensionNames(local_arena, [:0]const u8);
-        const available_extensions = try vkutil.enumerateInstanceExtensionPropertiesAlloc(local_arena, bd, null);
-        const available_extension_set: std.StringArrayHashMap(void).Unmanaged = available_extension_set: {
-            var available_extension_set = std.StringArrayHashMap(void).init(local_arena);
-
-            for (available_extensions) |*ext| {
-                const str = std.mem.sliceTo(std.mem.span(&ext.extension_name), 0);
-                try available_extension_set.putNoClobber(str, {});
-            }
-
-            break :available_extension_set available_extension_set.unmanaged;
-        };
-        const selected_extensions: std.ArrayHashMapUnmanaged([*:0]const u8, void, ArrayCStringContext, true) = selected_extensions: {
-            var selected_extensions = std.ArrayHashMap([*:0]const u8, void, ArrayCStringContext, true).init(local_arena);
-            errdefer selected_extensions.deinit();
-
-            try selected_extensions.ensureUnusedCapacity(desired_extensions.len);
-            for (desired_extensions) |p_desired_extension| {
-                const desired_extension = std.mem.span(p_desired_extension);
-                if (available_extension_set.contains(desired_extension)) {
-                    selected_extensions.putAssumeCapacityNoClobber(desired_extension, {});
-                } else {
-                    std.log.warn("Desired instance extension '{s}' not available.", .{desired_extension});
-                }
-            }
-
-            break :selected_extensions selected_extensions.unmanaged;
-        };
+        const desired_extensions: []const [:0]const u8 = try desiredInstanceExtensionNames(local_arena, [:0]const u8);
+        const available_extensions: []const vk.ExtensionProperties = try vkutil.enumerateInstanceExtensionPropertiesAlloc(local_arena, bd, null);
+        const selected_extensions = try selectExtensionNames(allocator, available_extensions, [:0]const u8, desired_extensions).unwrap();
 
         log_layers_and_extensions: {
             var log_buff = std.ArrayList(u8).init(local_arena);
@@ -656,38 +631,7 @@ const VkEngine = struct {
         const available_extensions = try vkutil.enumerateDeviceExtensionPropertiesAlloc(allocator, instance_dsp, physical_device);
         defer allocator.free(available_extensions);
 
-        const available_extension_set: std.StringArrayHashMapUnmanaged(void) = available_extension_set: {
-            var available_extension_set = std.StringArrayHashMap(void).init(allocator);
-            errdefer available_extension_set.deinit();
-
-            try available_extension_set.ensureUnusedCapacity(available_extensions.len);
-            for (available_extensions) |*ext| {
-                available_extension_set.putAssumeCapacityNoClobber(std.meta.assumeSentinel(std.mem.sliceTo(&ext.extension_name, 0), 0), {});
-            }
-
-            break :available_extension_set available_extension_set.unmanaged;
-        };
-        defer {
-            var copy = available_extension_set;
-            copy.deinit(allocator);
-        }
-
-        const selected_extensions: std.ArrayHashMapUnmanaged([*:0]const u8, void, ArrayCStringContext, true) = selected_extensions: {
-            var selected_extensions = std.ArrayHashMap([*:0]const u8, void, ArrayCStringContext, true).init(allocator);
-            errdefer selected_extensions.deinit();
-
-            try selected_extensions.ensureUnusedCapacity(desired_extensions.len);
-            for (desired_extensions) |p_desired_extension| {
-                const desired_extension = std.mem.span(p_desired_extension);
-                if (available_extension_set.contains(desired_extension)) {
-                    selected_extensions.putAssumeCapacityNoClobber(desired_extension, {});
-                } else {
-                    std.log.warn("Desired device extension '{s}' not available.", .{desired_extension});
-                }
-            }
-
-            break :selected_extensions selected_extensions.unmanaged;
-        };
+        const selected_extensions = try selectExtensionNames(allocator, available_extensions, [:0]const u8, desired_extensions).unwrap();
         defer {
             var copy = selected_extensions;
             copy.deinit(allocator);
@@ -754,7 +698,114 @@ const VkEngine = struct {
         };
         return device.dsp.createSwapchainKHR(device.handle, &create_info, &vkutil.allocatorVulkanWrapper(&allocator));
     }
+
+    const EnsureDesiredExtensionsAreAvailableResult = Result(
+        std.ArrayHashMapUnmanaged([*:0]const u8, void, ArrayCStringContext, true),
+        std.mem.Allocator.Error || error{ExtensionUnavailable},
+        struct {
+            unavailable_extension: ?[:0]const u8 = null,
+        },
+    );
+    fn selectExtensionNames(
+        allocator: std.mem.Allocator,
+        /// Pointers to these will be referenced by the result, therefore
+        /// must have a lifetime equal to, or greater than the output.
+        available_extensions: []const vk.ExtensionProperties,
+        comptime InputStrType: type,
+        desired_extensions: []const InputStrType,
+    ) EnsureDesiredExtensionsAreAvailableResult {
+        const Res = EnsureDesiredExtensionsAreAvailableResult;
+        comptime std.debug.assert(
+            std.meta.trait.isSlice(InputStrType) and
+                std.meta.trait.isZigString(InputStrType),
+        );
+        const StringZHashMap = std.HashMap([:0]const u8, void, struct {
+            pub fn hash(ctx: @This(), str: [:0]const u8) u64 {
+                _ = ctx;
+                return std.hash_map.StringContext.hash(.{}, str);
+            }
+            pub fn eql(ctx: @This(), a: [:0]const u8, b: [:0]const u8) bool {
+                _ = ctx;
+                return std.hash_map.StringContext.eql(.{}, a, b);
+            }
+        }, std.hash_map.default_max_load_percentage);
+        const available_extension_set: StringZHashMap.Unmanaged = available_extension_set: {
+            var available_extension_set = StringZHashMap.init(allocator);
+
+            available_extension_set.ensureUnusedCapacity(@intCast(StringZHashMap.Size, available_extensions.len)) catch |err| {
+                available_extension_set.deinit();
+                return Res.initError(err, .{});
+            };
+            for (available_extensions) |*ext| {
+                const str = std.meta.assumeSentinel(std.mem.sliceTo(std.mem.span(&ext.extension_name), 0), 0);
+                available_extension_set.putAssumeCapacityNoClobber(str, {});
+            }
+
+            break :available_extension_set available_extension_set.unmanaged;
+        };
+        defer {
+            var copy = available_extension_set;
+            copy.deinit(allocator);
+        }
+
+        var selected_extensions = std.ArrayHashMap([*:0]const u8, void, ArrayCStringContext, true).init(allocator);
+
+        selected_extensions.ensureUnusedCapacity(desired_extensions.len) catch |err| {
+            selected_extensions.deinit();
+            return Res.initError(err, .{});
+        };
+        for (desired_extensions) |p_desired_extension| {
+            const desired_extension = std.mem.span(p_desired_extension);
+            if (available_extension_set.getKey(desired_extension)) |str| {
+                selected_extensions.putAssumeCapacityNoClobber(str.ptr, {});
+            } else {
+                return Res.initError(error.ExtensionUnavailable, .{ .unavailable_extension = desired_extension });
+            }
+        }
+
+        return Res.initOk(selected_extensions.unmanaged);
+    }
 };
+
+pub const ResultTag = enum { ok, err };
+pub fn Result(
+    comptime T: type,
+    comptime ErrSet: type,
+    comptime ErrPayload: type,
+) type {
+    comptime std.debug.assert(@typeInfo(ErrSet) == .ErrorSet);
+    return union(ResultTag) {
+        const Self = @This();
+        ok: Ok,
+        err: Err,
+
+        pub fn initOk(value: Ok) Self {
+            return Self{ .ok = value };
+        }
+        pub fn initError(code: Err.Code, info: Err.Info) Self {
+            return Self{ .err = Err{
+                .code = code,
+                .info = info,
+            } };
+        }
+
+        pub fn unwrap(self: Self) Err.Code!Ok {
+            return switch (self) {
+                .ok => |ok| ok,
+                .err => |err| err.code,
+            };
+        }
+
+        pub const Ok = T;
+        pub const Err = struct {
+            code: Err.Code,
+            info: Err.Info,
+
+            pub const Code = ErrSet;
+            pub const Info = ErrPayload;
+        };
+    };
+}
 
 const ArrayCStringContext = struct {
     pub fn hash(ctx: @This(), p_str: [*:0]const u8) u32 {
