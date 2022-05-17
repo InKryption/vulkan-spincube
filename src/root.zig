@@ -52,6 +52,7 @@ const DeviceDispatch = vk.DeviceWrapper(vk.DeviceCommandFlags{
 
     .createShaderModule = true,
     .destroyShaderModule = true,
+
     .createGraphicsPipelines = true,
     .destroyPipeline = true,
 
@@ -63,6 +64,33 @@ const DeviceDispatch = vk.DeviceWrapper(vk.DeviceCommandFlags{
 
     .createFramebuffer = true,
     .destroyFramebuffer = true,
+
+    .createCommandPool = true,
+    .destroyCommandPool = true,
+
+    .createSemaphore = true,
+    .destroySemaphore = true,
+
+    .createFence = true,
+    .destroyFence = true,
+    .resetFences = true,
+
+    .allocateCommandBuffers = true,
+    .freeCommandBuffers = true,
+
+    .beginCommandBuffer = true,
+    .endCommandBuffer = true,
+    .resetCommandBuffer = true,
+
+    .queueSubmit = true,
+    .queuePresentKHR = true,
+
+    .cmdBeginRenderPass = true,
+    .cmdEndRenderPass = true,
+    .cmdBindPipeline = true,
+    .cmdDraw = true,
+
+    .acquireNextImageKHR = true,
 });
 
 fn getInstanceProcAddress(handle: vk.Instance, name: [*:0]const u8) ?*const anyopaque {
@@ -158,7 +186,20 @@ pub fn main() !void {
                 .p_preserve_attachments = std.mem.span(&preserve_attachment_refs).ptr,
             },
         };
-        const subpass_dependencies = [_]vk.SubpassDependency{};
+        const subpass_dependencies = [_]vk.SubpassDependency{
+            .{ // image acquisition subpass dependency
+                .src_subpass = vk.SUBPASS_EXTERNAL,
+                .dst_subpass = 0,
+                //
+                .src_stage_mask = vk.PipelineStageFlags{ .color_attachment_output_bit = true },
+                .dst_stage_mask = vk.PipelineStageFlags{ .color_attachment_output_bit = true },
+                //
+                .src_access_mask = vk.AccessFlags{},
+                .dst_access_mask = vk.AccessFlags{ .color_attachment_write_bit = true },
+                //
+                .dependency_flags = vk.DependencyFlags{},
+            },
+        };
 
         break :graphics_render_pass try vk_context.device.dsp.createRenderPass(
             vk_context.device.handle,
@@ -222,9 +263,163 @@ pub fn main() !void {
         allocator.free(swapchain_framebuffers);
     }
 
+    const cmdpool: vk.CommandPool = try vk_context.device.dsp.createCommandPool(vk_context.device.handle, &vk.CommandPoolCreateInfo{
+        .flags = vk.CommandPoolCreateFlags{ .reset_command_buffer_bit = true },
+        .queue_family_index = vk_context.core_qfi.graphics,
+    }, &vkutil.allocatorVulkanWrapper(&allocator));
+    defer vk_context.device.dsp.destroyCommandPool(vk_context.device.handle, cmdpool, &vkutil.allocatorVulkanWrapper(&allocator));
+
+    const cmdbuffer: vk.CommandBuffer = cmdbuffer: {
+        var cmdbuffer: vk.CommandBuffer = undefined;
+        try vk_context.device.dsp.allocateCommandBuffers(vk_context.device.handle, &vk.CommandBufferAllocateInfo{
+            .command_pool = cmdpool,
+            .level = .primary,
+            .command_buffer_count = 1,
+        }, @ptrCast(*[1]vk.CommandBuffer, &cmdbuffer));
+        break :cmdbuffer cmdbuffer;
+    };
+    defer vk_context.device.dsp.freeCommandBuffers(vk_context.device.handle, cmdpool, 1, @ptrCast(*const [1]vk.CommandBuffer, &cmdbuffer));
+
+    const sem_image_available: vk.Semaphore = try vk_context.device.dsp.createSemaphore(
+        vk_context.device.handle,
+        &vk.SemaphoreCreateInfo{ .flags = .{} },
+        &vkutil.allocatorVulkanWrapper(&allocator),
+    );
+    defer vk_context.device.dsp.destroySemaphore(vk_context.device.handle, sem_image_available, &vkutil.allocatorVulkanWrapper(&allocator));
+
+    const sem_render_finished: vk.Semaphore = try vk_context.device.dsp.createSemaphore(
+        vk_context.device.handle,
+        &vk.SemaphoreCreateInfo{ .flags = .{} },
+        &vkutil.allocatorVulkanWrapper(&allocator),
+    );
+    defer vk_context.device.dsp.destroySemaphore(vk_context.device.handle, sem_render_finished, &vkutil.allocatorVulkanWrapper(&allocator));
+
+    const fence_in_flight: vk.Fence = try vk_context.device.dsp.createFence(
+        vk_context.device.handle,
+        &vk.FenceCreateInfo{ .flags = vk.FenceCreateFlags{ .signaled_bit = true } },
+        &vkutil.allocatorVulkanWrapper(&allocator),
+    );
+    defer vk_context.device.dsp.destroyFence(vk_context.device.handle, fence_in_flight, &vkutil.allocatorVulkanWrapper(&allocator));
+
     while (!window.shouldClose()) {
         try glfw.pollEvents();
+
+        try drawFrame(
+            vk_context.device,
+            vk_context.swapchain,
+            graphics_pipeline,
+            cmdbuffer,
+            graphics_render_pass,
+            swapchain_framebuffers,
+            .{
+                .graphics = vk_context.getCoreDeviceQueue(.graphics, 0),
+                .present = vk_context.getCoreDeviceQueue(.present, 0),
+            },
+            .{
+                .fence_in_flight = fence_in_flight,
+                .sem_image_available = sem_image_available,
+                .sem_render_finished = sem_render_finished,
+            },
+        );
     }
+}
+
+fn drawFrame(
+    device: VulkanContext.VulkanDevice,
+    swapchain: VulkanContext.Swapchain,
+    pipeline: vk.Pipeline,
+    cmdbuffer: vk.CommandBuffer,
+    render_pass: vk.RenderPass,
+    framebuffers: []const vk.Framebuffer,
+    queues: struct {
+        graphics: vk.Queue,
+        present: vk.Queue,
+    },
+    syncs: struct {
+        /// must be in a signalled state
+        fence_in_flight: vk.Fence,
+        sem_image_available: vk.Semaphore,
+        sem_render_finished: vk.Semaphore,
+    },
+) !void {
+    try device.dsp.resetFences(device.handle, 1, @ptrCast(*const [1]vk.Fence, &syncs.fence_in_flight));
+    const image_index: u32 = if (device.dsp.acquireNextImageKHR(device.handle, swapchain.handle, std.math.maxInt(u64), syncs.sem_image_available, .null_handle)) |ret| blk: {
+        if (ret.result != .success) {
+            std.log.warn("acquireNextImageKHR: {s}.", .{@tagName(ret.result)});
+        }
+        break :blk ret.image_index;
+    } else |err| return err;
+
+    try device.dsp.resetCommandBuffer(cmdbuffer, vk.CommandBufferResetFlags{});
+    try recordCommandBuffer(device.dsp, cmdbuffer, pipeline, render_pass, framebuffers[image_index], swapchain.details.extent);
+
+    try device.dsp.queueSubmit(queues.graphics, 1, &[_]vk.SubmitInfo{.{
+        .wait_semaphore_count = 1,
+        .p_wait_semaphores = &[_]vk.Semaphore{syncs.sem_image_available},
+        .p_wait_dst_stage_mask = &[_]vk.PipelineStageFlags{.{ .color_attachment_output_bit = true }},
+
+        .command_buffer_count = 1,
+        .p_command_buffers = &[_]vk.CommandBuffer{cmdbuffer},
+
+        .signal_semaphore_count = 1,
+        .p_signal_semaphores = &[_]vk.Semaphore{syncs.sem_render_finished},
+    }}, syncs.fence_in_flight);
+
+    if (device.dsp.queuePresentKHR(queues.present, &vk.PresentInfoKHR{
+        .wait_semaphore_count = 1,
+        .p_wait_semaphores = &[_]vk.Semaphore{syncs.sem_render_finished},
+
+        .swapchain_count = 1,
+        .p_swapchains = &[_]vk.SwapchainKHR{swapchain.handle},
+
+        .p_image_indices = &[_]u32{image_index},
+        .p_results = @as(?[*]vk.Result, null),
+    })) |result| switch (result) {
+        .success => {},
+        else => std.log.warn("queuePresentKHR: {s}.", .{@tagName(result)}),
+    } else |err| return err;
+}
+
+fn recordCommandBuffer(
+    device_dsp: DeviceDispatch,
+    cmdbuffer: vk.CommandBuffer,
+    pipeline: vk.Pipeline,
+    render_pass: vk.RenderPass,
+    framebuffer: vk.Framebuffer,
+    swapchain_extent: vk.Extent2D,
+) !void {
+    try device_dsp.beginCommandBuffer(cmdbuffer, &vk.CommandBufferBeginInfo{
+        .flags = .{},
+        .p_inheritance_info = null,
+    });
+
+    {
+        device_dsp.cmdBeginRenderPass(cmdbuffer, &vk.RenderPassBeginInfo{
+            .render_pass = render_pass,
+            .framebuffer = framebuffer,
+            .render_area = vk.Rect2D{
+                .offset = vk.Offset2D{ .x = 0, .y = 0 },
+                .extent = swapchain_extent,
+            },
+
+            .clear_value_count = 1,
+            .p_clear_values = &[_]vk.ClearValue{.{
+                .color = vk.ClearColorValue{ .float_32 = [4]f32{
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                } },
+            }},
+        }, .@"inline");
+
+        device_dsp.cmdBindPipeline(cmdbuffer, .graphics, pipeline);
+        device_dsp.cmdDraw(cmdbuffer, 3, 1, 0, 0);
+
+        device_dsp.cmdEndRenderPass(cmdbuffer);
+    }
+
+    try device_dsp.endCommandBuffer(cmdbuffer);
 }
 
 fn createGraphicsPipeline(
@@ -337,8 +532,8 @@ fn createGraphicsPipeline(
     };
 
     const dynamic_states = [_]vk.DynamicState{
-        .viewport,
-        .line_width,
+        // .viewport,
+        // .line_width,
     };
 
     const graphics_pipeline_create_info = vk.GraphicsPipelineCreateInfo{
@@ -378,7 +573,7 @@ fn createGraphicsPipeline(
         .p_dynamic_state = &vk.PipelineDynamicStateCreateInfo{
             .flags = .{},
             .dynamic_state_count = @intCast(u32, dynamic_states.len),
-            .p_dynamic_states = &dynamic_states,
+            .p_dynamic_states = std.mem.span(&dynamic_states).ptr,
         },
 
         .layout = layout,
@@ -415,8 +610,8 @@ const VulkanContext = struct {
     swapchain: Swapchain,
 
     const Swapchain = struct {
-        details: SwapchainDetails,
         handle: vk.SwapchainKHR,
+        details: SwapchainDetails,
         images: std.MultiArrayList(ImageHandleViewPair).Slice,
     };
 
