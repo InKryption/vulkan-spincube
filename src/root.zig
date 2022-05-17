@@ -54,6 +54,15 @@ const DeviceDispatch = vk.DeviceWrapper(vk.DeviceCommandFlags{
     .destroyShaderModule = true,
     .createGraphicsPipelines = true,
     .destroyPipeline = true,
+
+    .createPipelineLayout = true,
+    .destroyPipelineLayout = true,
+
+    .createRenderPass = true,
+    .destroyRenderPass = true,
+
+    .createFramebuffer = true,
+    .destroyFramebuffer = true,
 });
 
 fn getInstanceProcAddress(handle: vk.Instance, name: [*:0]const u8) ?*const anyopaque {
@@ -89,15 +98,142 @@ pub fn main() !void {
     _ = vk_context.getCoreDeviceQueue(.present, 0);
     _ = vk_context.getCoreDeviceQueue(.graphics, 0);
 
-    const graphics_pipeline = try createGraphicsPipeline(allocator, vk_context.device, vk_context.swapchain.details);
+    const graphics_pipeline_layout: vk.PipelineLayout = graphics_pipeline_layout: {
+        const set_layouts = [_]vk.DescriptorSetLayout{};
+        const push_constant_ranges = [_]vk.PushConstantRange{};
+
+        break :graphics_pipeline_layout try vk_context.device.dsp.createPipelineLayout(
+            vk_context.device.handle,
+            &vk.PipelineLayoutCreateInfo{
+                .flags = .{},
+
+                .set_layout_count = @intCast(u32, set_layouts.len),
+                .p_set_layouts = std.mem.span(&set_layouts).ptr,
+
+                .push_constant_range_count = @intCast(u32, push_constant_ranges.len),
+                .p_push_constant_ranges = std.mem.span(&push_constant_ranges).ptr,
+            },
+            &vkutil.allocatorVulkanWrapper(&allocator),
+        );
+    };
+    defer vk_context.device.dsp.destroyPipelineLayout(vk_context.device.handle, graphics_pipeline_layout, &vkutil.allocatorVulkanWrapper(&allocator));
+
+    const graphics_render_pass: vk.RenderPass = graphics_render_pass: {
+        const attachments = [_]vk.AttachmentDescription{
+            .{
+                .flags = .{},
+                .format = vk_context.swapchain.details.format.format,
+                .samples = vk.SampleCountFlags{ .@"1_bit" = true },
+                .load_op = .clear,
+                .store_op = .store,
+                .stencil_load_op = .dont_care,
+                .stencil_store_op = .dont_care,
+                .initial_layout = .@"undefined",
+                .final_layout = .present_src_khr,
+            },
+        };
+
+        const input_attachment_refs = [_]vk.AttachmentReference{};
+        const color_attachment_refs = [_]vk.AttachmentReference{.{
+            .attachment = 0,
+            .layout = .color_attachment_optimal,
+        }};
+        const preserve_attachment_refs = [_]u32{};
+
+        const subpasses = [_]vk.SubpassDescription{
+            .{
+                .flags = .{},
+                .pipeline_bind_point = .graphics,
+                //
+                .input_attachment_count = @intCast(u32, input_attachment_refs.len),
+                .p_input_attachments = std.mem.span(&input_attachment_refs).ptr,
+                //
+                .color_attachment_count = @intCast(u32, color_attachment_refs.len),
+                .p_color_attachments = &color_attachment_refs,
+                //
+                .p_resolve_attachments = null,
+                .p_depth_stencil_attachment = null,
+                //
+                .preserve_attachment_count = @intCast(u32, preserve_attachment_refs.len),
+                .p_preserve_attachments = std.mem.span(&preserve_attachment_refs).ptr,
+            },
+        };
+        const subpass_dependencies = [_]vk.SubpassDependency{};
+
+        break :graphics_render_pass try vk_context.device.dsp.createRenderPass(
+            vk_context.device.handle,
+            &vk.RenderPassCreateInfo{
+                .flags = .{},
+
+                .attachment_count = @intCast(u32, attachments.len),
+                .p_attachments = &attachments,
+
+                .subpass_count = @intCast(u32, subpasses.len),
+                .p_subpasses = &subpasses,
+
+                .dependency_count = @intCast(u32, subpass_dependencies.len),
+                .p_dependencies = std.mem.span(&subpass_dependencies).ptr,
+            },
+            &vkutil.allocatorVulkanWrapper(&allocator),
+        );
+    };
+    defer vk_context.device.dsp.destroyRenderPass(vk_context.device.handle, graphics_render_pass, &vkutil.allocatorVulkanWrapper(&allocator));
+
+    const graphics_pipeline: vk.Pipeline = try createGraphicsPipeline(
+        allocator,
+        vk_context.device,
+        vk_context.swapchain.details,
+        graphics_pipeline_layout,
+        graphics_render_pass,
+    );
     defer vk_context.device.dsp.destroyPipeline(vk_context.device.handle, graphics_pipeline, &vkutil.allocatorVulkanWrapper(&allocator));
+
+    const swapchain_framebuffers: []const vk.Framebuffer = swapchain_framebuffers: {
+        const image_views: []const vk.ImageView = vk_context.swapchain.images.items(.view);
+
+        const swapchain_framebuffers: []vk.Framebuffer = try allocator.alloc(vk.Framebuffer, image_views.len);
+        errdefer allocator.free(swapchain_framebuffers);
+
+        for (image_views) |view, i| {
+            errdefer for (swapchain_framebuffers[0..i]) |prev_fb| {
+                vk_context.device.dsp.destroyFramebuffer(vk_context.device.handle, prev_fb, &vkutil.allocatorVulkanWrapper(&allocator));
+            };
+
+            const attachments = [_]vk.ImageView{view};
+            swapchain_framebuffers[i] = try vk_context.device.dsp.createFramebuffer(vk_context.device.handle, &vk.FramebufferCreateInfo{
+                .flags = .{},
+                .render_pass = graphics_render_pass,
+
+                .attachment_count = @intCast(u32, attachments.len),
+                .p_attachments = &attachments,
+
+                .width = vk_context.swapchain.details.extent.width,
+                .height = vk_context.swapchain.details.extent.height,
+
+                .layers = 1,
+            }, &vkutil.allocatorVulkanWrapper(&allocator));
+        }
+        break :swapchain_framebuffers swapchain_framebuffers;
+    };
+    defer {
+        for (swapchain_framebuffers) |fb| {
+            vk_context.device.dsp.destroyFramebuffer(vk_context.device.handle, fb, &vkutil.allocatorVulkanWrapper(&allocator));
+        }
+        allocator.free(swapchain_framebuffers);
+    }
 
     while (!window.shouldClose()) {
         try glfw.pollEvents();
     }
 }
 
-fn createGraphicsPipeline(allocator: std.mem.Allocator, device: VulkanContext.VulkanDevice, swapchain_details: VulkanContext.SwapchainDetails) !vk.Pipeline {
+fn createGraphicsPipeline(
+    allocator: std.mem.Allocator,
+    device: VulkanContext.VulkanDevice,
+    swapchain_details: VulkanContext.SwapchainDetails,
+    layout: vk.PipelineLayout,
+    render_pass: vk.RenderPass,
+) !vk.Pipeline {
     const vk_allocator: ?*const vk.AllocationCallbacks = &vkutil.allocatorVulkanWrapper(&allocator);
 
     const vert_shader_module: vk.ShaderModule = try device.dsp.createShaderModule(device.handle, &vk.ShaderModuleCreateInfo{
@@ -149,10 +285,68 @@ fn createGraphicsPipeline(allocator: std.mem.Allocator, device: VulkanContext.Vu
         },
     };
 
+    const rasterization_state_create_info: vk.PipelineRasterizationStateCreateInfo = .{
+        .flags = .{},
+        .depth_clamp_enable = vk.FALSE,
+        .rasterizer_discard_enable = vk.FALSE,
+        .polygon_mode = .fill,
+        .cull_mode = vk.CullModeFlags{ .back_bit = true },
+        .front_face = .clockwise,
+        .depth_bias_enable = vk.FALSE,
+        .depth_bias_constant_factor = 0.0,
+        .depth_bias_clamp = 0.0,
+        .depth_bias_slope_factor = 0.0,
+        .line_width = 1.0,
+    };
+
+    const multisample_state_create_info: vk.PipelineMultisampleStateCreateInfo = .{
+        .flags = .{},
+        .rasterization_samples = vk.SampleCountFlags{ .@"1_bit" = true },
+        .sample_shading_enable = vk.FALSE,
+        .min_sample_shading = 1.0,
+        .p_sample_mask = null,
+        .alpha_to_coverage_enable = vk.FALSE,
+        .alpha_to_one_enable = vk.FALSE,
+    };
+
+    const color_blend_attachment_states = [_]vk.PipelineColorBlendAttachmentState{
+        .{
+            .blend_enable = vk.FALSE,
+            .src_color_blend_factor = .one,
+            .dst_color_blend_factor = .zero,
+            .color_blend_op = .add,
+            .src_alpha_blend_factor = .one,
+            .dst_alpha_blend_factor = .zero,
+            .alpha_blend_op = .add,
+            .color_write_mask = vk.ColorComponentFlags{
+                .r_bit = true,
+                .g_bit = true,
+                .b_bit = true,
+                .a_bit = true,
+            },
+        },
+    };
+
+    const color_blend_state_create_info: vk.PipelineColorBlendStateCreateInfo = .{
+        .flags = .{},
+        .logic_op_enable = vk.FALSE,
+        .logic_op = .copy,
+        .attachment_count = @intCast(u32, color_blend_attachment_states.len),
+        .p_attachments = &color_blend_attachment_states,
+        .blend_constants = [1]f32{0.0} ** 4,
+    };
+
+    const dynamic_states = [_]vk.DynamicState{
+        .viewport,
+        .line_width,
+    };
+
     const graphics_pipeline_create_info = vk.GraphicsPipelineCreateInfo{
         .flags = vk.PipelineCreateFlags{},
+
         .stage_count = @intCast(u32, shader_stage_create_infos.len),
         .p_stages = &shader_stage_create_infos,
+
         .p_vertex_input_state = &vk.PipelineVertexInputStateCreateInfo{
             .flags = .{},
 
@@ -177,33 +371,38 @@ fn createGraphicsPipeline(allocator: std.mem.Allocator, device: VulkanContext.Vu
             .scissor_count = @intCast(u32, scissors.len),
             .p_scissors = &scissors,
         },
-        .p_rasterization_state = null,
-        .p_multisample_state = null,
+        .p_rasterization_state = &rasterization_state_create_info,
+        .p_multisample_state = &multisample_state_create_info,
         .p_depth_stencil_state = null,
-        .p_color_blend_state = null,
-        .p_dynamic_state = null,
-        .layout = .null_handle,
-        .render_pass = .null_handle,
+        .p_color_blend_state = &color_blend_state_create_info,
+        .p_dynamic_state = &vk.PipelineDynamicStateCreateInfo{
+            .flags = .{},
+            .dynamic_state_count = @intCast(u32, dynamic_states.len),
+            .p_dynamic_states = &dynamic_states,
+        },
+
+        .layout = layout,
+        .render_pass = render_pass,
         .subpass = 0,
         .base_pipeline_handle = .null_handle,
-        .base_pipeline_index = 0,
+        .base_pipeline_index = -1,
     };
 
-    var pipelines: [1]vk.Pipeline = undefined;
+    var pipeline: vk.Pipeline = undefined;
     if (device.dsp.createGraphicsPipelines(
         device.handle,
         .null_handle,
         @intCast(u32, 1),
         &[_]vk.GraphicsPipelineCreateInfo{graphics_pipeline_create_info},
         vk_allocator,
-        &pipelines,
+        @ptrCast(*[1]vk.Pipeline, &pipeline),
     )) |result| switch (result) {
         .success => {},
         .pipeline_compile_required => unreachable, // ?
         else => unreachable,
     } else |err| return err;
 
-    return pipelines[0];
+    return pipeline;
 }
 
 const VulkanContext = struct {
@@ -379,8 +578,13 @@ const VulkanContext = struct {
             }
 
             const images: []const vk.Image = swapchain_images.items(.img);
-            for (swapchain_images.items(.view)) |*p_view, i| {
-                const view_create_info = vk.ImageViewCreateInfo{
+            const views: []vk.ImageView = swapchain_images.items(.view);
+            for (views) |*p_view, i| {
+                errdefer for (views[0..i]) |prev_view| {
+                    device.dsp.destroyImageView(device.handle, prev_view, &vkutil.allocatorVulkanWrapper(&allocator));
+                };
+
+                p_view.* = try device.dsp.createImageView(device.handle, &vk.ImageViewCreateInfo{
                     .flags = vk.ImageViewCreateFlags{},
                     .image = images[i],
                     .view_type = .@"2d",
@@ -398,13 +602,7 @@ const VulkanContext = struct {
                         .base_array_layer = 0,
                         .layer_count = 1,
                     },
-                };
-                p_view.* = device.dsp.createImageView(device.handle, &view_create_info, &vkutil.allocatorVulkanWrapper(&allocator)) catch |err| {
-                    for (swapchain_images.items(.view)) |view| {
-                        device.dsp.destroyImageView(device.handle, view, &vkutil.allocatorVulkanWrapper(&allocator));
-                    }
-                    return err;
-                };
+                }, &vkutil.allocatorVulkanWrapper(&allocator));
             }
 
             break :swapchain_images swapchain_images.toOwnedSlice();
