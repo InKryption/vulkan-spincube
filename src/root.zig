@@ -105,6 +105,7 @@ const file_logger = @import("file_logger.zig");
 pub const log = file_logger.log;
 pub const log_level: std.log.Level = @field(std.log.Level, @tagName(build_options.log_level));
 
+const max_frames_in_flight = 2;
 pub fn main() !void {
     try file_logger.init("vulkan-spincube.log", .{ .stderr_level = .err }, &.{.gpa});
     defer file_logger.deinit();
@@ -345,7 +346,7 @@ fn drawFrame(
     if (device.dsp.waitForFences(device.handle, 1, @ptrCast(*const [1]vk.Fence, &syncs.fence_in_flight), vk.TRUE, std.math.maxInt(u64))) |result| {
         switch (result) {
             .success => {},
-            .timeout => unreachable,
+            .timeout => @panic(std.fmt.comptimePrint("wow ok, that somehow took {d} seconds.", .{std.math.maxInt(u64) / std.time.ns_per_s})),
             else => unreachable,
         }
     } else |err| return err;
