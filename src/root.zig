@@ -118,7 +118,7 @@ pub fn main() !void {
     try glfw.init(.{});
     defer glfw.terminate();
 
-    const window = try glfw.Window.create(100, 100, "vulkan-spincube", null, null, glfw.Window.Hints{ .client_api = .no_api });
+    const window = try glfw.Window.create(400, 400, "vulkan-spincube", null, null, glfw.Window.Hints{ .client_api = .no_api });
     defer window.destroy();
 
     var vk_context = try VulkanContext.init(allocator, getInstanceProcAddress, window);
@@ -267,49 +267,117 @@ pub fn main() !void {
     }, &vkutil.allocatorVulkanWrapper(&allocator));
     defer vk_context.device.dsp.destroyCommandPool(vk_context.device.handle, cmdpool, &vkutil.allocatorVulkanWrapper(&allocator));
 
-    const cmdbuffer: vk.CommandBuffer = cmdbuffer: {
-        var cmdbuffer: vk.CommandBuffer = undefined;
+    const SyncronizedFrame = struct {
+        cmdbuffer: vk.CommandBuffer,
+        image_available: vk.Semaphore,
+        render_finished: vk.Semaphore,
+        in_flight: vk.Fence,
+    };
+    const syncronized_frames: std.MultiArrayList(SyncronizedFrame).Slice = syncronized_frames: {
+        const syncronized_frames: std.MultiArrayList(SyncronizedFrame).Slice = blk: {
+            var syncronized_frames = std.MultiArrayList(SyncronizedFrame){};
+            try syncronized_frames.resize(allocator, max_frames_in_flight);
+            break :blk syncronized_frames.toOwnedSlice();
+        };
+        errdefer {
+            var copy = syncronized_frames;
+            copy.deinit(allocator);
+        }
+
         try vk_context.device.dsp.allocateCommandBuffers(vk_context.device.handle, &vk.CommandBufferAllocateInfo{
             .command_pool = cmdpool,
             .level = .primary,
-            .command_buffer_count = 1,
-        }, @ptrCast(*[1]vk.CommandBuffer, &cmdbuffer));
-        break :cmdbuffer cmdbuffer;
+            .command_buffer_count = @intCast(u32, syncronized_frames.len),
+        }, syncronized_frames.items(.cmdbuffer).ptr);
+        errdefer vk_context.device.dsp.freeCommandBuffers(
+            vk_context.device.handle,
+            cmdpool,
+            @intCast(u32, syncronized_frames.len),
+            syncronized_frames.items(.cmdbuffer).ptr,
+        );
+
+        const in_flight_fences = syncronized_frames.items(.in_flight);
+        for (in_flight_fences) |*fence, i| {
+            errdefer for (in_flight_fences[0..i]) |prev| {
+                vk_context.device.dsp.destroyFence(vk_context.device.handle, prev, &vkutil.allocatorVulkanWrapper(&allocator));
+            };
+
+            fence.* = try vk_context.device.dsp.createFence(
+                vk_context.device.handle,
+                &vk.FenceCreateInfo{ .flags = vk.FenceCreateFlags{ .signaled_bit = true } },
+                &vkutil.allocatorVulkanWrapper(&allocator),
+            );
+        }
+        errdefer for (in_flight_fences) |fence| {
+            vk_context.device.dsp.destroyFence(vk_context.device.handle, fence, &vkutil.allocatorVulkanWrapper(&allocator));
+        };
+
+        const closure: struct {
+            a: *const std.mem.Allocator,
+            dev: *const VulkanContext.VulkanDevice,
+
+            fn initSemaphores(closure: @This(), semaphores: []vk.Semaphore) !void {
+                for (semaphores) |*sem, i| {
+                    errdefer closure.deinitSemaphores(semaphores[0..i]);
+
+                    sem.* = try closure.dev.dsp.createSemaphore(
+                        closure.dev.handle,
+                        &vk.SemaphoreCreateInfo{ .flags = .{} },
+                        &vkutil.allocatorVulkanWrapper(closure.a),
+                    );
+                }
+            }
+
+            fn deinitSemaphores(closure: @This(), semaphores: []const vk.Semaphore) void {
+                for (semaphores) |sem| {
+                    closure.dev.dsp.destroySemaphore(closure.dev.handle, sem, &vkutil.allocatorVulkanWrapper(closure.a));
+                }
+            }
+        } = .{ .a = &allocator, .dev = &vk_context.device };
+
+        const image_available_sems = syncronized_frames.items(.image_available);
+        try closure.initSemaphores(image_available_sems);
+        errdefer closure.deinitSemaphores(image_available_sems);
+
+        const render_finished_sems = syncronized_frames.items(.render_finished);
+        try closure.initSemaphores(render_finished_sems);
+        errdefer closure.deinitSemaphores(render_finished_sems);
+
+        break :syncronized_frames syncronized_frames;
     };
-    defer vk_context.device.dsp.freeCommandBuffers(vk_context.device.handle, cmdpool, 1, @ptrCast(*const [1]vk.CommandBuffer, &cmdbuffer));
+    defer {
+        inline for (.{ .render_finished, .image_available }) |field| {
+            for (syncronized_frames.items(field)) |sem| {
+                vk_context.device.dsp.destroySemaphore(vk_context.device.handle, sem, &vkutil.allocatorVulkanWrapper(&allocator));
+            }
+        }
 
-    const sem_image_available: vk.Semaphore = try vk_context.device.dsp.createSemaphore(
-        vk_context.device.handle,
-        &vk.SemaphoreCreateInfo{ .flags = .{} },
-        &vkutil.allocatorVulkanWrapper(&allocator),
-    );
-    defer vk_context.device.dsp.destroySemaphore(vk_context.device.handle, sem_image_available, &vkutil.allocatorVulkanWrapper(&allocator));
+        for (syncronized_frames.items(.in_flight)) |fence| {
+            vk_context.device.dsp.destroyFence(vk_context.device.handle, fence, &vkutil.allocatorVulkanWrapper(&allocator));
+        }
 
-    const sem_render_finished: vk.Semaphore = try vk_context.device.dsp.createSemaphore(
-        vk_context.device.handle,
-        &vk.SemaphoreCreateInfo{ .flags = .{} },
-        &vkutil.allocatorVulkanWrapper(&allocator),
-    );
-    defer vk_context.device.dsp.destroySemaphore(vk_context.device.handle, sem_render_finished, &vkutil.allocatorVulkanWrapper(&allocator));
+        vk_context.device.dsp.freeCommandBuffers(vk_context.device.handle, cmdpool, @intCast(u32, syncronized_frames.len), syncronized_frames.items(.cmdbuffer).ptr);
 
-    const fence_in_flight: vk.Fence = try vk_context.device.dsp.createFence(
-        vk_context.device.handle,
-        &vk.FenceCreateInfo{ .flags = vk.FenceCreateFlags{ .signaled_bit = true } },
-        &vkutil.allocatorVulkanWrapper(&allocator),
-    );
-    defer vk_context.device.dsp.destroyFence(vk_context.device.handle, fence_in_flight, &vkutil.allocatorVulkanWrapper(&allocator));
+        var copy = syncronized_frames;
+        copy.deinit(allocator);
+    }
 
-    defer vk_context.device.dsp.deviceWaitIdle(vk_context.device.handle) catch |err|
-        std.log.err("deviceWaitIdle: {}", .{err});
+    var current_frame: u32 = 0;
+    defer vk_context.device.dsp.deviceWaitIdle(vk_context.device.handle) catch |err| std.log.err("deviceWaitIdle: {}", .{err});
 
     while (!window.shouldClose()) {
         try glfw.pollEvents();
-
+        {
+            const fbsize = try window.getFramebufferSize();
+            if (fbsize.width == 0) continue;
+            if (fbsize.height == 0) continue;
+        }
         try drawFrame(
-            vk_context.device,
-            vk_context.swapchain,
+            allocator,
+            &vk_context,
+            window,
             graphics_pipeline,
-            cmdbuffer,
+            syncronized_frames.items(.cmdbuffer)[current_frame],
             graphics_render_pass,
             swapchain_framebuffers,
             .{
@@ -317,17 +385,21 @@ pub fn main() !void {
                 .present = vk_context.getCoreDeviceQueue(.present, 0),
             },
             .{
-                .fence_in_flight = fence_in_flight,
-                .sem_image_available = sem_image_available,
-                .sem_render_finished = sem_render_finished,
+                .fence_in_flight = syncronized_frames.items(.in_flight)[current_frame],
+                .sem_image_available = syncronized_frames.items(.image_available)[current_frame],
+                .sem_render_finished = syncronized_frames.items(.render_finished)[current_frame],
             },
         );
+        current_frame = (current_frame + 1) % max_frames_in_flight;
     }
 }
 
 fn drawFrame(
-    device: VulkanContext.VulkanDevice,
-    swapchain: VulkanContext.Swapchain,
+    /// must be same allocator used to create the supplied the `VulkanContext`.
+    allocator: std.mem.Allocator,
+    vk_context: *VulkanContext,
+    /// must be the same window used to create the `VulkanContext`.
+    window: glfw.Window,
     pipeline: vk.Pipeline,
     cmdbuffer: vk.CommandBuffer,
     render_pass: vk.RenderPass,
@@ -343,7 +415,7 @@ fn drawFrame(
         sem_render_finished: vk.Semaphore,
     },
 ) !void {
-    if (device.dsp.waitForFences(device.handle, 1, @ptrCast(*const [1]vk.Fence, &syncs.fence_in_flight), vk.TRUE, std.math.maxInt(u64))) |result| {
+    if (vk_context.device.dsp.waitForFences(vk_context.device.handle, 1, @ptrCast(*const [1]vk.Fence, &syncs.fence_in_flight), vk.TRUE, std.math.maxInt(u64))) |result| {
         switch (result) {
             .success => {},
             .timeout => @panic(std.fmt.comptimePrint("wow ok, that somehow took {d} seconds.", .{std.math.maxInt(u64) / std.time.ns_per_s})),
@@ -351,21 +423,49 @@ fn drawFrame(
         }
     } else |err| return err;
 
-    try device.dsp.resetFences(device.handle, 1, @ptrCast(*const [1]vk.Fence, &syncs.fence_in_flight));
-    const image_index: u32 = if (device.dsp.acquireNextImageKHR(device.handle, swapchain.handle, std.math.maxInt(u64), syncs.sem_image_available, .null_handle)) |ret| blk: {
+    const image_index: u32 = if (vk_context.device.dsp.acquireNextImageKHR(
+        vk_context.device.handle,
+        vk_context.swapchain.handle,
+        std.math.maxInt(u64),
+        syncs.sem_image_available,
+        .null_handle,
+    )) |ret| blk: {
         if (ret.result != .success) {
             std.log.warn("acquireNextImageKHR: {s}.", .{@tagName(ret.result)});
         }
         break :blk ret.image_index;
-    } else |err| return err;
+    } else |err| switch (err) {
+        error.OutOfDateKHR => {
+            vk_context.swapchain.destroy(allocator, vk_context.device);
+            vk_context.swapchain = try VulkanContext.Swapchain.create(
+                allocator,
+                vk_context.inst,
+                vk_context.device,
+                vk_context.physical_device,
+                vk_context.surface_khr,
+                framebuffer_size: {
+                    const fbsize = try window.getFramebufferSize();
+                    break :framebuffer_size vk.Extent2D{
+                        .width = fbsize.width,
+                        .height = fbsize.height,
+                    };
+                },
+                vk_context.core_qfi,
+            );
+            return;
+        },
+        else => return err,
+    };
 
-    try device.dsp.resetCommandBuffer(cmdbuffer, vk.CommandBufferResetFlags{});
-    try recordCommandBuffer(device.dsp, cmdbuffer, pipeline, render_pass, framebuffers[image_index], swapchain.details.extent);
+    try vk_context.device.dsp.resetFences(vk_context.device.handle, 1, @ptrCast(*const [1]vk.Fence, &syncs.fence_in_flight));
+
+    try vk_context.device.dsp.resetCommandBuffer(cmdbuffer, vk.CommandBufferResetFlags{});
+    try recordCommandBuffer(vk_context.device.dsp, cmdbuffer, pipeline, render_pass, framebuffers[image_index], vk_context.swapchain.details.extent);
 
     const wait_semaphores: []const vk.Semaphore = &.{syncs.sem_image_available};
     const signal_semaphores: []const vk.Semaphore = &.{syncs.sem_render_finished};
 
-    try device.dsp.queueSubmit(queues.graphics, 1, &[_]vk.SubmitInfo{.{
+    try vk_context.device.dsp.queueSubmit(queues.graphics, 1, &[_]vk.SubmitInfo{.{
         .wait_semaphore_count = @intCast(u32, wait_semaphores.len),
         .p_wait_semaphores = wait_semaphores.ptr,
         .p_wait_dst_stage_mask = &[_]vk.PipelineStageFlags{.{ .color_attachment_output_bit = true }},
@@ -377,12 +477,12 @@ fn drawFrame(
         .p_signal_semaphores = signal_semaphores.ptr,
     }}, syncs.fence_in_flight);
 
-    if (device.dsp.queuePresentKHR(queues.present, &vk.PresentInfoKHR{
+    if (vk_context.device.dsp.queuePresentKHR(queues.present, &vk.PresentInfoKHR{
         .wait_semaphore_count = @intCast(u32, signal_semaphores.len),
         .p_wait_semaphores = signal_semaphores.ptr,
 
         .swapchain_count = 1,
-        .p_swapchains = &[_]vk.SwapchainKHR{swapchain.handle},
+        .p_swapchains = &[_]vk.SwapchainKHR{vk_context.swapchain.handle},
 
         .p_image_indices = &[_]u32{image_index},
         .p_results = @as(?[*]vk.Result, null),
@@ -621,12 +721,6 @@ const VulkanContext = struct {
     surface_khr: vk.SurfaceKHR,
     swapchain: Swapchain,
 
-    const Swapchain = struct {
-        handle: vk.SwapchainKHR,
-        details: SwapchainDetails,
-        images: std.MultiArrayList(ImageHandleViewPair).Slice,
-    };
-
     pub fn init(
         allocator: std.mem.Allocator,
         instanceProcLoader: anytype,
@@ -661,166 +755,14 @@ const VulkanContext = struct {
         const device = try initVkDevice(allocator, inst.dsp, physical_device, core_qfi);
         errdefer device.dsp.destroyDevice(device.handle, &vkutil.allocatorVulkanWrapper(&allocator));
 
-        const swapchain_details: SwapchainDetails = swapchain_details: {
-            const capabilities = try inst.dsp.getPhysicalDeviceSurfaceCapabilitiesKHR(physical_device, surface_khr);
-            const selected_format: vk.SurfaceFormatKHR = selected_format: {
-                const formats: []const vk.SurfaceFormatKHR = try vkutil.getPhysicalDeviceSurfaceFormatsKHRAlloc(
-                    allocator,
-                    inst.dsp,
-                    physical_device,
-                    surface_khr,
-                );
-                defer allocator.free(formats);
-
-                if (formats.len == 0) return error.NoSurfaceFormatsAvailable;
-                for (formats) |format| {
-                    if (format.format == .b8g8r8a8_srgb and format.color_space == .srgb_nonlinear_khr) {
-                        std.log.debug("Selected surface format: {}", .{format});
-                        break :selected_format format;
-                    }
-                }
-
-                break :selected_format formats[0];
+        const swapchain = try Swapchain.create(allocator, inst, device, physical_device, surface_khr, framebuffer_size: {
+            const window_fbsize = try window.getFramebufferSize();
+            break :framebuffer_size vk.Extent2D{
+                .width = window_fbsize.width,
+                .height = window_fbsize.height,
             };
-            const selected_present_mode: vk.PresentModeKHR = selected_present_mode: {
-                const present_modes: []const vk.PresentModeKHR = try vkutil.getPhysicalDeviceSurfacePresentModesKHRAlloc(
-                    allocator,
-                    inst.dsp,
-                    physical_device,
-                    surface_khr,
-                );
-                defer allocator.free(present_modes);
-
-                if (present_modes.len == 0) return error.NoSurfacePresentModesAvailable;
-                if (std.mem.indexOfScalar(vk.PresentModeKHR, present_modes, .mailbox_khr)) |i| {
-                    break :selected_present_mode present_modes[i];
-                }
-                std.debug.assert(std.mem.indexOfScalar(vk.PresentModeKHR, present_modes, .fifo_khr) != null);
-                break :selected_present_mode .fifo_khr;
-            };
-            const selected_extent: vk.Extent2D = selected_extent: {
-                if (std.math.maxInt(u32) != capabilities.current_extent.width and
-                    std.math.maxInt(u32) != capabilities.current_extent.height)
-                {
-                    break :selected_extent capabilities.current_extent;
-                }
-
-                const framebuffer_size: vk.Extent2D = framebuffer_size: {
-                    const fb_size = try window.getFramebufferSize();
-                    break :framebuffer_size vk.Extent2D{
-                        .width = fb_size.width,
-                        .height = fb_size.height,
-                    };
-                };
-
-                break :selected_extent vk.Extent2D{
-                    .width = std.math.clamp(framebuffer_size.width, capabilities.min_image_extent.width, capabilities.max_image_extent.width),
-                    .height = std.math.clamp(framebuffer_size.height, capabilities.min_image_extent.height, capabilities.max_image_extent.height),
-                };
-            };
-            const image_count: u32 = image_count: {
-                const min_image_count: u32 = capabilities.min_image_count;
-                const max_image_count: u32 = if (capabilities.max_image_count == 0) std.math.maxInt(u32) else capabilities.max_image_count;
-                break :image_count std.math.clamp(min_image_count + 1, min_image_count, max_image_count);
-            };
-            break :swapchain_details SwapchainDetails{
-                .capabilities = capabilities,
-                .format = selected_format,
-                .present_mode = selected_present_mode,
-                .extent = selected_extent,
-                .image_count = image_count,
-            };
-        };
-        const swapchain_khr = swapchain_khr: {
-            const qfi_array: std.BoundedArray(u32, std.meta.fields(CoreQueueFamilyIndices).len) = qfi_array: {
-                var qfi_array = std.BoundedArray(u32, std.meta.fields(CoreQueueFamilyIndices).len).init(0) catch unreachable;
-                if (core_qfi.graphics != core_qfi.present) {
-                    qfi_array.appendSlice(&.{ core_qfi.graphics, core_qfi.present }) catch unreachable;
-                }
-                break :qfi_array qfi_array;
-            };
-
-            break :swapchain_khr try device.dsp.createSwapchainKHR(device.handle, &vk.SwapchainCreateInfoKHR{
-                .flags = vk.SwapchainCreateFlagsKHR{},
-                .surface = surface_khr,
-
-                .min_image_count = swapchain_details.image_count,
-                .image_format = swapchain_details.format.format,
-                .image_color_space = swapchain_details.format.color_space,
-                .image_extent = swapchain_details.extent,
-                .image_array_layers = 1,
-                .image_usage = vk.ImageUsageFlags{ .color_attachment_bit = true },
-
-                .image_sharing_mode = if (qfi_array.len > 1) .concurrent else .exclusive,
-                .queue_family_index_count = @intCast(u32, qfi_array.len),
-                .p_queue_family_indices = qfi_array.slice().ptr,
-
-                .pre_transform = swapchain_details.capabilities.current_transform,
-                .composite_alpha = vk.CompositeAlphaFlagsKHR{ .opaque_bit_khr = true },
-                .present_mode = swapchain_details.present_mode,
-                .clipped = vk.TRUE,
-                .old_swapchain = .null_handle,
-            }, &vkutil.allocatorVulkanWrapper(&allocator));
-        };
-        errdefer device.dsp.destroySwapchainKHR(device.handle, swapchain_khr, &vkutil.allocatorVulkanWrapper(&allocator));
-
-        const swapchain_images: std.MultiArrayList(ImageHandleViewPair).Slice = swapchain_images: {
-            var swapchain_images: std.MultiArrayList(ImageHandleViewPair) = .{};
-            errdefer swapchain_images.deinit(allocator);
-
-            {
-                var count: u32 = undefined;
-                if (device.dsp.getSwapchainImagesKHR(device.handle, swapchain_khr, &count, null)) |result| switch (result) {
-                    .success => {},
-                    else => unreachable,
-                } else |err| return err;
-
-                std.debug.assert(count >= swapchain_details.image_count);
-                try swapchain_images.resize(allocator, count);
-
-                if (device.dsp.getSwapchainImagesKHR(device.handle, swapchain_khr, &count, swapchain_images.items(.img).ptr)) |result| switch (result) {
-                    .success => {},
-                    else => unreachable,
-                } else |err| return err;
-            }
-
-            const images: []const vk.Image = swapchain_images.items(.img);
-            const views: []vk.ImageView = swapchain_images.items(.view);
-            for (views) |*p_view, i| {
-                errdefer for (views[0..i]) |prev_view| {
-                    device.dsp.destroyImageView(device.handle, prev_view, &vkutil.allocatorVulkanWrapper(&allocator));
-                };
-
-                p_view.* = try device.dsp.createImageView(device.handle, &vk.ImageViewCreateInfo{
-                    .flags = vk.ImageViewCreateFlags{},
-                    .image = images[i],
-                    .view_type = .@"2d",
-                    .format = swapchain_details.format.format,
-                    .components = vk.ComponentMapping{
-                        .r = .identity,
-                        .g = .identity,
-                        .b = .identity,
-                        .a = .identity,
-                    },
-                    .subresource_range = vk.ImageSubresourceRange{
-                        .aspect_mask = vk.ImageAspectFlags{ .color_bit = true },
-                        .base_mip_level = 0,
-                        .level_count = 1,
-                        .base_array_layer = 0,
-                        .layer_count = 1,
-                    },
-                }, &vkutil.allocatorVulkanWrapper(&allocator));
-            }
-
-            break :swapchain_images swapchain_images.toOwnedSlice();
-        };
-        errdefer {
-            var copy = swapchain_images;
-            for (copy.items(.view)) |view| {
-                device.dsp.destroyImageView(device.handle, view, &vkutil.allocatorVulkanWrapper(&allocator));
-            }
-            copy.deinit(allocator);
-        }
+        }, core_qfi);
+        errdefer swapchain.destroy(allocator, device);
 
         return VulkanContext{
             .inst = inst,
@@ -829,11 +771,7 @@ const VulkanContext = struct {
             .core_qfi = core_qfi,
             .device = device,
             .surface_khr = surface_khr,
-            .swapchain = .{
-                .details = swapchain_details,
-                .handle = swapchain_khr,
-                .images = swapchain_images,
-            },
+            .swapchain = swapchain,
         };
     }
     pub fn deinit(self: *VulkanContext, allocator: std.mem.Allocator) void {
@@ -856,6 +794,190 @@ const VulkanContext = struct {
     pub fn getCoreDeviceQueue(self: VulkanContext, comptime id: CoreQueueFamilyId, index: u32) vk.Queue {
         return self.device.dsp.getDeviceQueue(self.device.handle, @field(self.core_qfi, @tagName(id)), index);
     }
+
+    pub const Swapchain = struct {
+        handle: vk.SwapchainKHR,
+        details: SwapchainDetails,
+        images: std.MultiArrayList(ImageHandleViewPair).Slice,
+
+        pub fn create(
+            allocator: std.mem.Allocator,
+            inst: VulkanInst,
+            device: VulkanDevice,
+            physical_device: vk.PhysicalDevice,
+            surface_khr: vk.SurfaceKHR,
+            framebuffer_size: vk.Extent2D,
+            core_qfi: CoreQueueFamilyIndices,
+        ) !Swapchain {
+            const swapchain_details: SwapchainDetails = swapchain_details: {
+                const capabilities = try inst.dsp.getPhysicalDeviceSurfaceCapabilitiesKHR(physical_device, surface_khr);
+                const selected_format: vk.SurfaceFormatKHR = selected_format: {
+                    const formats: []const vk.SurfaceFormatKHR = try vkutil.getPhysicalDeviceSurfaceFormatsKHRAlloc(
+                        allocator,
+                        inst.dsp,
+                        physical_device,
+                        surface_khr,
+                    );
+                    defer allocator.free(formats);
+
+                    if (formats.len == 0) return error.NoSurfaceFormatsAvailable;
+                    for (formats) |format| {
+                        if (format.format == .b8g8r8a8_srgb and format.color_space == .srgb_nonlinear_khr) {
+                            std.log.debug("Selected surface format: {}", .{format});
+                            break :selected_format format;
+                        }
+                    }
+
+                    break :selected_format formats[0];
+                };
+                const selected_present_mode: vk.PresentModeKHR = selected_present_mode: {
+                    const present_modes: []const vk.PresentModeKHR = try vkutil.getPhysicalDeviceSurfacePresentModesKHRAlloc(
+                        allocator,
+                        inst.dsp,
+                        physical_device,
+                        surface_khr,
+                    );
+                    defer allocator.free(present_modes);
+
+                    if (present_modes.len == 0) return error.NoSurfacePresentModesAvailable;
+                    if (std.mem.indexOfScalar(vk.PresentModeKHR, present_modes, .mailbox_khr)) |i| {
+                        break :selected_present_mode present_modes[i];
+                    }
+                    std.debug.assert(std.mem.indexOfScalar(vk.PresentModeKHR, present_modes, .fifo_khr) != null);
+                    break :selected_present_mode .fifo_khr;
+                };
+                const selected_extent: vk.Extent2D = selected_extent: {
+                    if (std.math.maxInt(u32) != capabilities.current_extent.width and
+                        std.math.maxInt(u32) != capabilities.current_extent.height)
+                    {
+                        break :selected_extent capabilities.current_extent;
+                    }
+
+                    break :selected_extent vk.Extent2D{
+                        .width = std.math.clamp(framebuffer_size.width, capabilities.min_image_extent.width, capabilities.max_image_extent.width),
+                        .height = std.math.clamp(framebuffer_size.height, capabilities.min_image_extent.height, capabilities.max_image_extent.height),
+                    };
+                };
+                const image_count: u32 = image_count: {
+                    const min_image_count: u32 = capabilities.min_image_count;
+                    const max_image_count: u32 = if (capabilities.max_image_count == 0) std.math.maxInt(u32) else capabilities.max_image_count;
+                    break :image_count std.math.clamp(min_image_count + 1, min_image_count, max_image_count);
+                };
+                break :swapchain_details SwapchainDetails{
+                    .capabilities = capabilities,
+                    .format = selected_format,
+                    .present_mode = selected_present_mode,
+                    .extent = selected_extent,
+                    .image_count = image_count,
+                };
+            };
+            const swapchain_khr = swapchain_khr: {
+                const qfi_array: std.BoundedArray(u32, std.meta.fields(CoreQueueFamilyIndices).len) = qfi_array: {
+                    var qfi_array = std.BoundedArray(u32, std.meta.fields(CoreQueueFamilyIndices).len).init(0) catch unreachable;
+                    if (core_qfi.graphics != core_qfi.present) {
+                        qfi_array.appendSlice(&.{ core_qfi.graphics, core_qfi.present }) catch unreachable;
+                    }
+                    break :qfi_array qfi_array;
+                };
+
+                break :swapchain_khr try device.dsp.createSwapchainKHR(device.handle, &vk.SwapchainCreateInfoKHR{
+                    .flags = vk.SwapchainCreateFlagsKHR{},
+                    .surface = surface_khr,
+
+                    .min_image_count = swapchain_details.image_count,
+                    .image_format = swapchain_details.format.format,
+                    .image_color_space = swapchain_details.format.color_space,
+                    .image_extent = swapchain_details.extent,
+                    .image_array_layers = 1,
+                    .image_usage = vk.ImageUsageFlags{ .color_attachment_bit = true },
+
+                    .image_sharing_mode = if (qfi_array.len > 1) .concurrent else .exclusive,
+                    .queue_family_index_count = @intCast(u32, qfi_array.len),
+                    .p_queue_family_indices = qfi_array.slice().ptr,
+
+                    .pre_transform = swapchain_details.capabilities.current_transform,
+                    .composite_alpha = vk.CompositeAlphaFlagsKHR{ .opaque_bit_khr = true },
+                    .present_mode = swapchain_details.present_mode,
+                    .clipped = vk.TRUE,
+                    .old_swapchain = .null_handle,
+                }, &vkutil.allocatorVulkanWrapper(&allocator));
+            };
+            errdefer device.dsp.destroySwapchainKHR(device.handle, swapchain_khr, &vkutil.allocatorVulkanWrapper(&allocator));
+
+            const swapchain_images: std.MultiArrayList(ImageHandleViewPair).Slice = swapchain_images: {
+                var swapchain_images: std.MultiArrayList(ImageHandleViewPair) = .{};
+                errdefer swapchain_images.deinit(allocator);
+
+                {
+                    var count: u32 = undefined;
+                    if (device.dsp.getSwapchainImagesKHR(device.handle, swapchain_khr, &count, null)) |result| switch (result) {
+                        .success => {},
+                        else => unreachable,
+                    } else |err| return err;
+
+                    std.debug.assert(count >= swapchain_details.image_count);
+                    try swapchain_images.resize(allocator, count);
+
+                    if (device.dsp.getSwapchainImagesKHR(device.handle, swapchain_khr, &count, swapchain_images.items(.img).ptr)) |result| switch (result) {
+                        .success => {},
+                        else => unreachable,
+                    } else |err| return err;
+                }
+
+                const images: []const vk.Image = swapchain_images.items(.img);
+                const views: []vk.ImageView = swapchain_images.items(.view);
+                for (views) |*p_view, i| {
+                    errdefer for (views[0..i]) |prev_view| {
+                        device.dsp.destroyImageView(device.handle, prev_view, &vkutil.allocatorVulkanWrapper(&allocator));
+                    };
+
+                    p_view.* = try device.dsp.createImageView(device.handle, &vk.ImageViewCreateInfo{
+                        .flags = vk.ImageViewCreateFlags{},
+                        .image = images[i],
+                        .view_type = .@"2d",
+                        .format = swapchain_details.format.format,
+                        .components = vk.ComponentMapping{
+                            .r = .identity,
+                            .g = .identity,
+                            .b = .identity,
+                            .a = .identity,
+                        },
+                        .subresource_range = vk.ImageSubresourceRange{
+                            .aspect_mask = vk.ImageAspectFlags{ .color_bit = true },
+                            .base_mip_level = 0,
+                            .level_count = 1,
+                            .base_array_layer = 0,
+                            .layer_count = 1,
+                        },
+                    }, &vkutil.allocatorVulkanWrapper(&allocator));
+                }
+
+                break :swapchain_images swapchain_images.toOwnedSlice();
+            };
+            errdefer {
+                var copy = swapchain_images;
+                for (copy.items(.view)) |view| {
+                    device.dsp.destroyImageView(device.handle, view, &vkutil.allocatorVulkanWrapper(&allocator));
+                }
+                copy.deinit(allocator);
+            }
+
+            return Swapchain{
+                .handle = swapchain_khr,
+                .details = swapchain_details,
+                .images = swapchain_images,
+            };
+        }
+
+        pub fn destroy(swapchain: *Swapchain, allocator: std.mem.Allocator, device: VulkanDevice) void {
+            for (swapchain.images.items(.view)) |view| {
+                device.dsp.destroyImageView(device.handle, view, &vkutil.allocatorVulkanWrapper(&allocator));
+            }
+            swapchain.images.deinit(allocator);
+            device.dsp.destroySwapchainKHR(device.handle, swapchain.handle, &vkutil.allocatorVulkanWrapper(&allocator));
+            swapchain.* = undefined;
+        }
+    };
 
     const VulkanInst = struct { handle: vk.Instance, dsp: InstanceDispatch };
     const VulkanDevice = struct { handle: vk.Device, dsp: DeviceDispatch };
