@@ -42,6 +42,7 @@ const DeviceDispatchMin = vk.DeviceWrapper(vk.DeviceCommandFlags{ .destroyDevice
 const DeviceDispatch = vk.DeviceWrapper(vk.DeviceCommandFlags{
     .destroyDevice = true,
     .getDeviceQueue = true,
+    .deviceWaitIdle = true,
 
     .createSwapchainKHR = true,
     .destroySwapchainKHR = true,
@@ -74,6 +75,7 @@ const DeviceDispatch = vk.DeviceWrapper(vk.DeviceCommandFlags{
     .createFence = true,
     .destroyFence = true,
     .resetFences = true,
+    .waitForFences = true,
 
     .allocateCommandBuffers = true,
     .freeCommandBuffers = true,
@@ -107,12 +109,10 @@ pub fn main() !void {
     try file_logger.init("vulkan-spincube.log", .{ .stderr_level = .err }, &.{.gpa});
     defer file_logger.deinit();
 
-    var gpa = if (builtin.mode == .Debug) std.heap.GeneralPurposeAllocator(.{ .verbose_log = false, .stack_trace_frames = 8 }){};
-    defer if (builtin.mode == .Debug) {
-        _ = gpa.deinit();
-    };
+    var gpa = std.heap.GeneralPurposeAllocator(.{ .safety = true, .verbose_log = false, .stack_trace_frames = 8 }){};
+    defer _ = gpa.deinit();
 
-    const allocator: std.mem.Allocator = if (builtin.mode == .Debug) gpa.allocator() else std.heap.c_allocator;
+    const allocator: std.mem.Allocator = gpa.allocator();
 
     try glfw.init(.{});
     defer glfw.terminate();
@@ -122,9 +122,6 @@ pub fn main() !void {
 
     var vk_context = try VulkanContext.init(allocator, getInstanceProcAddress, window);
     defer vk_context.deinit(allocator);
-
-    _ = vk_context.getCoreDeviceQueue(.present, 0);
-    _ = vk_context.getCoreDeviceQueue(.graphics, 0);
 
     const graphics_pipeline_layout: vk.PipelineLayout = graphics_pipeline_layout: {
         const set_layouts = [_]vk.DescriptorSetLayout{};
@@ -301,6 +298,9 @@ pub fn main() !void {
     );
     defer vk_context.device.dsp.destroyFence(vk_context.device.handle, fence_in_flight, &vkutil.allocatorVulkanWrapper(&allocator));
 
+    defer vk_context.device.dsp.deviceWaitIdle(vk_context.device.handle) catch |err|
+        std.log.err("deviceWaitIdle: {}", .{err});
+
     while (!window.shouldClose()) {
         try glfw.pollEvents();
 
@@ -342,6 +342,14 @@ fn drawFrame(
         sem_render_finished: vk.Semaphore,
     },
 ) !void {
+    if (device.dsp.waitForFences(device.handle, 1, @ptrCast(*const [1]vk.Fence, &syncs.fence_in_flight), vk.TRUE, std.math.maxInt(u64))) |result| {
+        switch (result) {
+            .success => {},
+            .timeout => unreachable,
+            else => unreachable,
+        }
+    } else |err| return err;
+
     try device.dsp.resetFences(device.handle, 1, @ptrCast(*const [1]vk.Fence, &syncs.fence_in_flight));
     const image_index: u32 = if (device.dsp.acquireNextImageKHR(device.handle, swapchain.handle, std.math.maxInt(u64), syncs.sem_image_available, .null_handle)) |ret| blk: {
         if (ret.result != .success) {
@@ -353,21 +361,24 @@ fn drawFrame(
     try device.dsp.resetCommandBuffer(cmdbuffer, vk.CommandBufferResetFlags{});
     try recordCommandBuffer(device.dsp, cmdbuffer, pipeline, render_pass, framebuffers[image_index], swapchain.details.extent);
 
+    const wait_semaphores: []const vk.Semaphore = &.{syncs.sem_image_available};
+    const signal_semaphores: []const vk.Semaphore = &.{syncs.sem_render_finished};
+
     try device.dsp.queueSubmit(queues.graphics, 1, &[_]vk.SubmitInfo{.{
-        .wait_semaphore_count = 1,
-        .p_wait_semaphores = &[_]vk.Semaphore{syncs.sem_image_available},
+        .wait_semaphore_count = @intCast(u32, wait_semaphores.len),
+        .p_wait_semaphores = wait_semaphores.ptr,
         .p_wait_dst_stage_mask = &[_]vk.PipelineStageFlags{.{ .color_attachment_output_bit = true }},
 
         .command_buffer_count = 1,
         .p_command_buffers = &[_]vk.CommandBuffer{cmdbuffer},
 
-        .signal_semaphore_count = 1,
-        .p_signal_semaphores = &[_]vk.Semaphore{syncs.sem_render_finished},
+        .signal_semaphore_count = @intCast(u32, signal_semaphores.len),
+        .p_signal_semaphores = signal_semaphores.ptr,
     }}, syncs.fence_in_flight);
 
     if (device.dsp.queuePresentKHR(queues.present, &vk.PresentInfoKHR{
-        .wait_semaphore_count = 1,
-        .p_wait_semaphores = &[_]vk.Semaphore{syncs.sem_render_finished},
+        .wait_semaphore_count = @intCast(u32, signal_semaphores.len),
+        .p_wait_semaphores = signal_semaphores.ptr,
 
         .swapchain_count = 1,
         .p_swapchains = &[_]vk.SwapchainKHR{swapchain.handle},
