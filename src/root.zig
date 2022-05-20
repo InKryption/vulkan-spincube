@@ -613,23 +613,12 @@ pub fn main() !void {
     defer vkutil.destroyDevice(allocator, device.dsp, device.handle);
 
     var swapchain: Swapchain = swapchain: {
+        var slice_arena = std.heap.ArenaAllocator.init(allocator);
+        defer slice_arena.deinit();
+
         const capabilities = try inst.dsp.getPhysicalDeviceSurfaceCapabilitiesKHR(physical_device, window_surface);
-
-        const formats: []const vk.SurfaceFormatKHR = try vkutil.getPhysicalDeviceSurfaceFormatsKHRAlloc(
-            allocator,
-            inst.dsp,
-            physical_device,
-            window_surface,
-        );
-        defer allocator.free(formats);
-
-        const present_modes: []const vk.PresentModeKHR = try vkutil.getPhysicalDeviceSurfacePresentModesKHRAlloc(
-            allocator,
-            inst.dsp,
-            physical_device,
-            window_surface,
-        );
-        defer allocator.free(present_modes);
+        const formats = try vkutil.getPhysicalDeviceSurfaceFormatsKHRAlloc(slice_arena.allocator(), inst.dsp, physical_device, window_surface);
+        const present_modes = try vkutil.getPhysicalDeviceSurfacePresentModesKHRAlloc(slice_arena.allocator(), inst.dsp, physical_device, window_surface);
 
         break :swapchain try Swapchain.create(allocator, device, window_surface, formats, present_modes, capabilities, core_qfi, framebuffer_size: {
             const fb_size = try window.getFramebufferSize();
@@ -1042,23 +1031,12 @@ pub fn main() !void {
             if (fbsize.width != swapchain.details.extent.width or
                 fbsize.height != swapchain.details.extent.height)
             {
+                var slice_arena = std.heap.ArenaAllocator.init(allocator);
+                defer slice_arena.deinit();
+
                 const capabilities = try inst.dsp.getPhysicalDeviceSurfaceCapabilitiesKHR(physical_device, window_surface);
-
-                const formats: []const vk.SurfaceFormatKHR = try vkutil.getPhysicalDeviceSurfaceFormatsKHRAlloc(
-                    allocator,
-                    inst.dsp,
-                    physical_device,
-                    window_surface,
-                );
-                defer allocator.free(formats);
-
-                const present_modes: []const vk.PresentModeKHR = try vkutil.getPhysicalDeviceSurfacePresentModesKHRAlloc(
-                    allocator,
-                    inst.dsp,
-                    physical_device,
-                    window_surface,
-                );
-                defer allocator.free(present_modes);
+                const formats = try vkutil.getPhysicalDeviceSurfaceFormatsKHRAlloc(slice_arena.allocator(), inst.dsp, physical_device, window_surface);
+                const present_modes = try vkutil.getPhysicalDeviceSurfacePresentModesKHRAlloc(slice_arena.allocator(), inst.dsp, physical_device, window_surface);
 
                 try swapchain.recreate(allocator, device, window_surface, formats, present_modes, capabilities, core_qfi, fbsize);
                 for (swapchain_framebuffers.items) |fb| {
