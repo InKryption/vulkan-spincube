@@ -1019,7 +1019,7 @@ pub fn main() !void {
     defer device.dsp.deviceWaitIdle(device.handle) catch |err| std.log.err("deviceWaitIdle: {}", .{err});
     mainloop: while (!window.shouldClose()) {
         try glfw.pollEvents();
-        {
+        ensure_framebuffer_compat: {
             const fbsize: vk.Extent2D = fbsize: {
                 const fbsize = try window.getFramebufferSize();
                 break :fbsize vk.Extent2D{
@@ -1045,6 +1045,8 @@ pub fn main() !void {
                 try swapchain_framebuffers.resize(swapchain.images.len);
                 try swapchain.populateFramebuffers(allocator, device, graphics_render_pass, swapchain_framebuffers.items);
             }
+
+            break :ensure_framebuffer_compat;
         }
 
         draw_frame: {
