@@ -94,6 +94,35 @@ const Swapchain = struct {
         try populateImages(allocator, device, self.handle, self.details, &self.images);
     }
 
+    fn populateFramebuffers(
+        self: Swapchain,
+        allocator: std.mem.Allocator,
+        device: VulkanDevice,
+        render_pass: vk.RenderPass,
+        framebuffers: []vk.Framebuffer,
+    ) !void {
+        std.debug.assert(framebuffers.len == self.images.len);
+
+        for (self.images.items(.view)) |view, i| {
+            errdefer for (framebuffers[0..i]) |prev_fb| {
+                device.dsp.destroyFramebuffer(device.handle, prev_fb, &vkutil.allocCallbacksFrom(&allocator));
+            };
+            const attachments = [_]vk.ImageView{view};
+            framebuffers[i] = try device.dsp.createFramebuffer(device.handle, &vk.FramebufferCreateInfo{
+                .flags = .{},
+                .render_pass = render_pass,
+
+                .attachment_count = @intCast(u32, attachments.len),
+                .p_attachments = &attachments,
+
+                .width = self.details.extent.width,
+                .height = self.details.extent.height,
+
+                .layers = 1,
+            }, &vkutil.allocCallbacksFrom(&allocator));
+        }
+    }
+
     fn figureOutDetails(
         capabilities: vk.SurfaceCapabilitiesKHR,
         framebuffer_size: vk.Extent2D,
@@ -883,29 +912,9 @@ pub fn main() !void {
 
     var swapchain_framebuffers: std.ArrayList(vk.Framebuffer) = swapchain_framebuffers: {
         var swapchain_framebuffers = std.ArrayList(vk.Framebuffer).init(allocator);
-        errdefer {
-            for (swapchain_framebuffers.items) |prev_fb| {
-                device.dsp.destroyFramebuffer(device.handle, prev_fb, &vkutil.allocCallbacksFrom(&allocator));
-            }
-            swapchain_framebuffers.deinit();
-        }
 
-        try swapchain_framebuffers.ensureUnusedCapacity(swapchain.images.len);
-        for (swapchain.images.items(.view)) |view| {
-            const attachments = [_]vk.ImageView{view};
-            swapchain_framebuffers.appendAssumeCapacity(try device.dsp.createFramebuffer(device.handle, &vk.FramebufferCreateInfo{
-                .flags = .{},
-                .render_pass = graphics_render_pass,
-
-                .attachment_count = @intCast(u32, attachments.len),
-                .p_attachments = &attachments,
-
-                .width = swapchain.details.extent.width,
-                .height = swapchain.details.extent.height,
-
-                .layers = 1,
-            }, &vkutil.allocCallbacksFrom(&allocator)));
-        }
+        try swapchain_framebuffers.resize(swapchain.images.len);
+        try swapchain.populateFramebuffers(allocator, device, graphics_render_pass, swapchain_framebuffers.items);
 
         break :swapchain_framebuffers swapchain_framebuffers;
     };
@@ -1055,23 +1064,8 @@ pub fn main() !void {
                 for (swapchain_framebuffers.items) |fb| {
                     device.dsp.destroyFramebuffer(device.handle, fb, &vkutil.allocCallbacksFrom(&allocator));
                 }
-                swapchain_framebuffers.shrinkRetainingCapacity(0);
-                try swapchain_framebuffers.ensureUnusedCapacity(swapchain.images.len);
-                for (swapchain.images.items(.view)) |view| {
-                    const attachments = [_]vk.ImageView{view};
-                    swapchain_framebuffers.appendAssumeCapacity(try device.dsp.createFramebuffer(device.handle, &vk.FramebufferCreateInfo{
-                        .flags = .{},
-                        .render_pass = graphics_render_pass,
-
-                        .attachment_count = @intCast(u32, attachments.len),
-                        .p_attachments = &attachments,
-
-                        .width = swapchain.details.extent.width,
-                        .height = swapchain.details.extent.height,
-
-                        .layers = 1,
-                    }, &vkutil.allocCallbacksFrom(&allocator)));
-                }
+                try swapchain_framebuffers.resize(swapchain.images.len);
+                try swapchain.populateFramebuffers(allocator, device, graphics_render_pass, swapchain_framebuffers.items);
             }
         }
 
