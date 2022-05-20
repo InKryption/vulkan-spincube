@@ -30,13 +30,10 @@ pub fn build(b: *std.build.Builder) void {
     const vk_shader_compile_step = vk.ShaderCompileStep.init(b, &.{"glslc"}, "shader-bytecode");
     exe.step.dependOn(&vk_shader_compile_step.step);
     {
-        const shader_frag = vk_shader_compile_step.add("src/shader.frag");
-        const shader_vert = vk_shader_compile_step.add("src/shader.vert");
-
         const shader_byte_code_paths = b.addOptions();
-        exe.addOptions("shader-bytecodes", shader_byte_code_paths);
-        shader_byte_code_paths.contents.writer().print("pub const frag = @embedFile(\"{s}\");\n", .{shader_frag}) catch unreachable;
-        shader_byte_code_paths.contents.writer().print("pub const vert = @embedFile(\"{s}\");\n", .{shader_vert}) catch unreachable;
+        exe.addOptions("shader-bytecode-paths", shader_byte_code_paths);
+        shader_byte_code_paths.addOptionFileSource("vert", .{ .path = vk_shader_compile_step.add("src/shader.vert") });
+        shader_byte_code_paths.addOptionFileSource("frag", .{ .path = vk_shader_compile_step.add("src/shader.frag") });
     }
 
     const run_cmd = exe.run();

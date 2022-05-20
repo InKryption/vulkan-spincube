@@ -5,7 +5,7 @@ const vk = @import("vulkan");
 const vkutil = @import("vkutil.zig");
 
 const build_options = @import("build_options");
-const shader_bytecode = @import("shader-bytecodes");
+const shader_bytecode_paths = @import("shader-bytecode-paths");
 const Result = @import("result.zig").Result;
 
 const VulkanInstance = struct {
@@ -273,6 +273,37 @@ const Swapchain = struct {
     }
 };
 
+const Vertex = extern struct {
+    pos: Pos,
+    color: Color,
+
+    const Pos = extern struct { x: f32, y: f32 };
+    const Color = extern struct { r: f32, g: f32, b: f32 };
+
+    fn bindingDescription(binding: u32) vk.VertexInputBindingDescription {
+        return vk.VertexInputBindingDescription{
+            .binding = binding,
+            .stride = @sizeOf(Vertex),
+            .input_rate = .vertex,
+        };
+    }
+
+    fn attributeDescription(binding: u32, comptime field: std.meta.FieldEnum(Vertex)) vk.VertexInputAttributeDescription {
+        return vk.VertexInputAttributeDescription{
+            .location = switch (field) {
+                .pos => 0,
+                .color => 1,
+            },
+            .binding = binding,
+            .format = switch (field) {
+                .pos => vk.Format.r32g32_sfloat,
+                .color => vk.Format.r32g32b32_sfloat,
+            },
+            .offset = @offsetOf(Vertex, @tagName(field)),
+        };
+    }
+};
+
 const BaseDispatch = vk.BaseWrapper(vk.BaseCommandFlags{
     .createInstance = true,
     .getInstanceProcAddr = true,
@@ -356,9 +387,21 @@ const DeviceDispatch = vk.DeviceWrapper(vk.DeviceCommandFlags{
     .cmdBeginRenderPass = true,
     .cmdEndRenderPass = true,
     .cmdBindPipeline = true,
+    .cmdBindVertexBuffers = true,
     .cmdDraw = true,
 
     .acquireNextImageKHR = true,
+
+    .createBuffer = true,
+    .destroyBuffer = true,
+    .getBufferMemoryRequirements = true,
+    .bindBufferMemory = true,
+
+    .allocateMemory = true,
+    .freeMemory = true,
+
+    .mapMemory = true,
+    .unmapMemory = true,
 });
 
 fn getInstanceProcAddress(handle: vk.Instance, name: [*:0]const u8) ?*const anyopaque {
@@ -373,7 +416,7 @@ pub const log_level: std.log.Level = std.enums.nameCast(std.log.Level, build_opt
 
 const max_frames_in_flight = 2;
 pub fn main() !void {
-    try file_logger.init("vulkan-spincube.log", .{ .stderr_level = .err });
+    try file_logger.init("vulkan-spincube.log", .{ .stderr_level = .warn });
     defer file_logger.deinit();
 
     var gpa = std.heap.GeneralPurposeAllocator(.{ .safety = true, .verbose_log = false, .stack_trace_frames = 8 }){};
@@ -411,11 +454,23 @@ pub fn main() !void {
         var local_arena = std.heap.ArenaAllocator.init(allocator);
         defer local_arena.deinit();
 
+        const desired_layers: []const [*:0]const u8 = desired_layers: {
+            var desired_layers = std.ArrayList([*:0]const u8).init(local_arena.allocator());
+            errdefer desired_layers.deinit();
+
+            if (build_options.vk_validation_layers) {
+                try desired_layers.append("VK_LAYER_KHRONOS_validation");
+            }
+
+            break :desired_layers desired_layers.toOwnedSlice();
+        };
         const desired_extensions: []const [*:0]const u8 = desired_extensions: {
             var desired_extensions = std.ArrayList([*:0]const u8).init(local_arena.allocator());
             errdefer desired_extensions.deinit();
 
-            try desired_extensions.append(vk.extension_info.ext_debug_utils.name);
+            if (build_options.vk_validation_layers) {
+                try desired_extensions.append(vk.extension_info.ext_debug_utils.name);
+            }
 
             {
                 const required_glfw_extensions = try glfw.getRequiredInstanceExtensions();
@@ -430,6 +485,7 @@ pub fn main() !void {
 
         const handle = try vkutil.createInstance(allocator, bdsp, vkutil.InstanceCreateInfo{
             .p_next = if (build_options.vk_validation_layers) &debug_messenger_create_info else null,
+            .enabled_layer_names = desired_layers,
             .enabled_extension_names = desired_extensions,
         });
         errdefer vkutil.destroyInstance(allocator, dsp_min, handle);
@@ -629,6 +685,79 @@ pub fn main() !void {
     };
     defer swapchain.destroy(allocator, device);
 
+    const vertices = [3]Vertex{
+        .{ .pos = Vertex.Pos{ .x = 0.0, .y = -0.5 }, .color = Vertex.Color{ .r = 1.0, .g = 0.0, .b = 0.0 } },
+        .{ .pos = Vertex.Pos{ .x = 0.5, .y = 0.5 }, .color = Vertex.Color{ .r = 0.0, .g = 1.0, .b = 0.0 } },
+        .{ .pos = Vertex.Pos{ .x = -0.5, .y = 0.5 }, .color = Vertex.Color{ .r = 0.0, .g = 0.0, .b = 1.0 } },
+    };
+
+    const BufferAndDevMem = struct {
+        buffer: vk.Buffer,
+        devmem: vk.DeviceMemory,
+        offset: vk.DeviceSize,
+        size: vk.DeviceSize,
+    };
+
+    const vertices_bufmem: BufferAndDevMem = vertices_bufmem: {
+        const vertices_buffer: vk.Buffer = try device.dsp.createBuffer(device.handle, &vk.BufferCreateInfo{
+            .flags = vk.BufferCreateFlags{},
+            .size = vertices.len * @sizeOf(Vertex),
+
+            .usage = vk.BufferUsageFlags{ .vertex_buffer_bit = true },
+            .sharing_mode = .exclusive,
+
+            .queue_family_index_count = 0,
+            .p_queue_family_indices = std.mem.span(&[_]u32{}).ptr,
+        }, &vkutil.allocCallbacksFrom(&allocator));
+        errdefer device.dsp.destroyBuffer(device.handle, vertices_buffer, &vkutil.allocCallbacksFrom(&allocator));
+
+        const requirements = device.dsp.getBufferMemoryRequirements(device.handle, vertices_buffer);
+
+        const vertices_buffer_memory: vk.DeviceMemory = vertices_buffer_memory: {
+            const required_memory_type: u32 = requirements.memory_type_bits;
+
+            const selected_memory_type_index: u32 = selected_memory_type_index: {
+                const properties = inst.dsp.getPhysicalDeviceMemoryProperties(physical_device);
+                const available_memory_types: []const vk.MemoryType = properties.memory_types[0..properties.memory_type_count];
+                for (available_memory_types) |mem_type, i| {
+                    if ((required_memory_type & std.math.shl(u32, 1, i) != 0) and mem_type.property_flags.contains(.{
+                        .host_visible_bit = true,
+                        .host_coherent_bit = true,
+                    })) {
+                        break :selected_memory_type_index @intCast(u32, i);
+                    }
+                }
+                return error.NoSuitableMemoryTypesOnSelectedPhysicalDevice;
+            };
+
+            break :vertices_buffer_memory try device.dsp.allocateMemory(device.handle, &vk.MemoryAllocateInfo{
+                .allocation_size = requirements.size,
+                .memory_type_index = selected_memory_type_index,
+            }, &vkutil.allocCallbacksFrom(&allocator));
+        };
+        errdefer device.dsp.freeMemory(device.handle, vertices_buffer_memory, &vkutil.allocCallbacksFrom(&allocator));
+
+        try device.dsp.bindBufferMemory(device.handle, vertices_buffer, vertices_buffer_memory, 0);
+        break :vertices_bufmem BufferAndDevMem{
+            .buffer = vertices_buffer,
+            .devmem = vertices_buffer_memory,
+            .offset = 0,
+            .size = requirements.size,
+        };
+    };
+    defer {
+        device.dsp.freeMemory(device.handle, vertices_bufmem.devmem, &vkutil.allocCallbacksFrom(&allocator));
+        device.dsp.destroyBuffer(device.handle, vertices_bufmem.buffer, &vkutil.allocCallbacksFrom(&allocator));
+    }
+
+    init_vertices_mufmem: {
+        const mapped_memory = (try device.dsp.mapMemory(device.handle, vertices_bufmem.devmem, 0, vertices_bufmem.size, .{})).?;
+        defer device.dsp.unmapMemory(device.handle, vertices_bufmem.devmem);
+
+        std.mem.copy(u8, @ptrCast([*]u8, mapped_memory)[0 .. @sizeOf(Vertex) * vertices.len], std.mem.sliceAsBytes(std.mem.span(&vertices)));
+        break :init_vertices_mufmem;
+    }
+
     const graphics_pipeline_layout: vk.PipelineLayout = graphics_pipeline_layout: {
         const set_layouts = [_]vk.DescriptorSetLayout{};
         const push_constant_ranges = [_]vk.PushConstantRange{};
@@ -726,17 +855,20 @@ pub fn main() !void {
     const graphics_pipeline: vk.Pipeline = graphics_pipeline: {
         const vk_allocator: ?*const vk.AllocationCallbacks = &vkutil.allocCallbacksFrom(&allocator);
 
+        const vert_bytecode = @embedFile(shader_bytecode_paths.vert);
+        const frag_bytecode = @embedFile(shader_bytecode_paths.frag);
+
         const vert_shader_module: vk.ShaderModule = try device.dsp.createShaderModule(device.handle, &vk.ShaderModuleCreateInfo{
             .flags = .{},
-            .code_size = shader_bytecode.vert.len,
-            .p_code = @ptrCast([*]const u32, shader_bytecode.vert),
+            .code_size = vert_bytecode.len,
+            .p_code = @ptrCast([*]const u32, vert_bytecode),
         }, vk_allocator);
         defer device.dsp.destroyShaderModule(device.handle, vert_shader_module, vk_allocator);
 
         const frag_shader_module: vk.ShaderModule = try device.dsp.createShaderModule(device.handle, &vk.ShaderModuleCreateInfo{
             .flags = .{},
-            .code_size = shader_bytecode.frag.len,
-            .p_code = @ptrCast([*]const u32, shader_bytecode.frag),
+            .code_size = frag_bytecode.len,
+            .p_code = @ptrCast([*]const u32, frag_bytecode),
         }, vk_allocator);
         defer device.dsp.destroyShaderModule(device.handle, frag_shader_module, vk_allocator);
 
@@ -831,6 +963,13 @@ pub fn main() !void {
             // .line_width,
         };
 
+        const vertex_binding_descriptions = [_]vk.VertexInputBindingDescription{
+            Vertex.bindingDescription(0),
+        };
+        const vertex_attribute_descriptions = [_]vk.VertexInputAttributeDescription{
+            Vertex.attributeDescription(0, .pos),
+            Vertex.attributeDescription(0, .color),
+        };
         const graphics_pipeline_create_info = vk.GraphicsPipelineCreateInfo{
             .flags = vk.PipelineCreateFlags{},
 
@@ -840,11 +979,11 @@ pub fn main() !void {
             .p_vertex_input_state = &vk.PipelineVertexInputStateCreateInfo{
                 .flags = .{},
 
-                .vertex_binding_description_count = 0,
-                .p_vertex_binding_descriptions = std.mem.span(&[_]vk.VertexInputBindingDescription{}).ptr,
+                .vertex_binding_description_count = @intCast(u32, vertex_binding_descriptions.len),
+                .p_vertex_binding_descriptions = &vertex_binding_descriptions,
 
-                .vertex_attribute_description_count = 0,
-                .p_vertex_attribute_descriptions = std.mem.span(&[_]vk.VertexInputAttributeDescription{}).ptr,
+                .vertex_attribute_description_count = @intCast(u32, vertex_attribute_descriptions.len),
+                .p_vertex_attribute_descriptions = &vertex_attribute_descriptions,
             },
             .p_input_assembly_state = &vk.PipelineInputAssemblyStateCreateInfo{
                 .flags = .{},
@@ -1112,7 +1251,8 @@ pub fn main() !void {
                 }, .@"inline");
 
                 device.dsp.cmdBindPipeline(cmdbuffer, .graphics, graphics_pipeline);
-                device.dsp.cmdDraw(cmdbuffer, 3, 1, 0, 0);
+                device.dsp.cmdBindVertexBuffers(cmdbuffer, 0, 1, &[_]vk.Buffer{vertices_bufmem.buffer}, &[_]vk.DeviceSize{vertices_bufmem.offset});
+                device.dsp.cmdDraw(cmdbuffer, vertices.len, 1, 0, 0);
 
                 device.dsp.cmdEndRenderPass(cmdbuffer);
 

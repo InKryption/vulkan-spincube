@@ -54,12 +54,15 @@ pub fn log(
         }
     }
 
-    comptime var real_fmt: []const u8 = "";
-    comptime real_fmt = real_fmt ++ message_level.asText();
-    comptime if (scope != .default) {
-        real_fmt = real_fmt ++ "(" ++ @tagName(scope) ++ ")";
+    const real_fmt = comptime real_fmt: {
+        var real_fmt: []const u8 = "";
+        real_fmt = real_fmt ++ message_level.asText();
+        if (scope != .default) {
+            real_fmt = real_fmt ++ "(" ++ @tagName(scope) ++ ")";
+        }
+        real_fmt = real_fmt ++ ": " ++ format ++ "\n";
+        break :real_fmt real_fmt;
     };
-    comptime real_fmt = real_fmt ++ ": " ++ format ++ "\n";
 
     writer.print(real_fmt, args) catch return;
 }
