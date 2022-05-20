@@ -1014,7 +1014,7 @@ pub fn main() !void {
     }
 
     var current_frame: u32 = 0;
-    defer device.dsp.deviceWaitIdle(device.handle) catch |err| std.log.err("deviceWaitIdle: {}", .{err});
+    defer device.dsp.deviceWaitIdle(device.handle) catch |err| std.log.err("deviceWaitIdle: {s}", .{@errorName(err)});
     mainloop: while (!window.shouldClose()) {
         try glfw.pollEvents();
         ensure_framebuffer_compat: {
