@@ -499,7 +499,6 @@ pub fn main() !void {
 
         break :physical_device physical_device;
     };
-    _ = physical_device;
 
     const window_surface: vk.SurfaceKHR = window_surface: {
         var window_surface: vk.SurfaceKHR = .null_handle;
