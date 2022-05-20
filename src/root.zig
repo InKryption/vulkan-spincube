@@ -935,7 +935,7 @@ pub fn main() !void {
 
     var current_frame: u32 = 0;
     defer device.dsp.deviceWaitIdle(device.handle) catch |err| std.log.err("deviceWaitIdle: {}", .{err});
-    while (!window.shouldClose()) {
+    mainloop: while (!window.shouldClose()) {
         try glfw.pollEvents();
         {
             const fbsize = try window.getFramebufferSize();
@@ -964,11 +964,17 @@ pub fn main() !void {
                 std.math.maxInt(u64),
                 image_available,
                 .null_handle,
-            )) |ret| blk: {
-                if (ret.result != .success) {
+            )) |ret| switch (ret.result) {
+                .success,
+                .suboptimal_khr,
+                => ret.image_index,
+                .not_ready => continue :mainloop,
+                .timeout => blk: {
                     std.log.warn("acquireNextImageKHR: {s}.", .{@tagName(ret.result)});
-                }
-                break :blk ret.image_index;
+                    break :blk ret.image_index;
+                },
+
+                else => unreachable,
             } else |err| switch (err) {
                 error.OutOfDateKHR => std.debug.todo(""),
                 else => return err,
