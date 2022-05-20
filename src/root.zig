@@ -373,7 +373,7 @@ pub const log_level: std.log.Level = std.enums.nameCast(std.log.Level, build_opt
 
 const max_frames_in_flight = 2;
 pub fn main() !void {
-    try file_logger.init("vulkan-spincube.log", .{ .stderr_level = .err }, null);
+    try file_logger.init("vulkan-spincube.log", .{ .stderr_level = .err });
     defer file_logger.deinit();
 
     var gpa = std.heap.GeneralPurposeAllocator(.{ .safety = true, .verbose_log = false, .stack_trace_frames = 8 }){};
