@@ -88,6 +88,9 @@ const Swapchain = struct {
         self.details = try figureOutDetails(capabilities, framebuffer_size, formats, present_modes);
         vkutil.destroySwapchainKHR(allocator, device.dsp, device.handle, self.handle);
         self.handle = try createSwapchainHandle(allocator, device, surface, self.details, core_qfi);
+        for (self.images.items(.view)) |view| {
+            vkutil.destroyImageView(allocator, device.dsp, device.handle, view);
+        }
         try populateImages(allocator, device, self.handle, self.details, &self.images);
     }
 
@@ -352,7 +355,7 @@ pub fn main() !void {
     try glfw.init(.{});
     defer glfw.terminate();
 
-    const window = try glfw.Window.create(400, 400, "vulkan-spincube", null, null, glfw.Window.Hints{ .client_api = .no_api });
+    const window = try glfw.Window.create(600, 600, "vulkan-spincube", null, null, glfw.Window.Hints{ .client_api = .no_api });
     defer window.destroy();
 
     const debug_messenger_create_info = if (build_options.vk_validation_layers) vk.DebugUtilsMessengerCreateInfoEXT{
@@ -1019,7 +1022,13 @@ pub fn main() !void {
     mainloop: while (!window.shouldClose()) {
         try glfw.pollEvents();
         {
-            const fbsize = try window.getFramebufferSize();
+            const fbsize: vk.Extent2D = fbsize: {
+                const fbsize = try window.getFramebufferSize();
+                break :fbsize vk.Extent2D{
+                    .width = fbsize.width,
+                    .height = fbsize.height,
+                };
+            };
             if (fbsize.width == 0 or fbsize.height == 0) continue;
             if (fbsize.width != swapchain.details.extent.width or
                 fbsize.height != swapchain.details.extent.height)
@@ -1042,17 +1051,7 @@ pub fn main() !void {
                 );
                 defer allocator.free(present_modes);
 
-                try swapchain.recreate(
-                    allocator,
-                    device,
-                    window_surface,
-                    formats,
-                    present_modes,
-                    capabilities,
-                    core_qfi,
-                    .{ .width = fbsize.width, .height = fbsize.height },
-                );
-
+                try swapchain.recreate(allocator, device, window_surface, formats, present_modes, capabilities, core_qfi, fbsize);
                 for (swapchain_framebuffers.items) |fb| {
                     device.dsp.destroyFramebuffer(device.handle, fb, &vkutil.allocCallbacksFrom(&allocator));
                 }
