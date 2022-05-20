@@ -4,12 +4,11 @@ const std = @import("std");
 var log_file_writer_mutex: std.Thread.Mutex = .{};
 var log_file_writer: std.io.BufferedWriter(1024 * 8, std.fs.File.Writer) = undefined;
 
-const Config = struct {
+var config: struct {
     stderr_level: ?std.log.Level,
     final_flush_retries: u16,
-    stderr_excluded_scopes: []const []const u8,
-};
-var config: Config = undefined;
+    included_scopes: ?[]const []const u8,
+} = undefined;
 
 pub const InitConfig = struct {
     stderr_level: ?std.log.Level = null,
@@ -18,18 +17,20 @@ pub const InitConfig = struct {
 pub fn init(
     rel_outpath: []const u8,
     cfg: InitConfig,
-    comptime stderr_excluded_scopes: []const @Type(.EnumLiteral),
+    comptime maybe_included_scopes: ?[]const @Type(.EnumLiteral),
 ) !void {
     config = .{
         .stderr_level = cfg.stderr_level,
         .final_flush_retries = cfg.final_flush_retries,
-        .stderr_excluded_scopes = comptime blk: {
-            var names: []const []const u8 = &.{};
-            for (stderr_excluded_scopes) |tag| {
-                names = names ++ &[_][]const u8{@tagName(tag)};
+        .included_scopes = if (maybe_included_scopes) |scopes| comptime included_scopes: {
+            var included_scopes: []const []const u8 = &.{};
+            for (scopes) |scope_tag| {
+                if (std.sort.binarySearch([]const u8, @tagName(scope_tag), included_scopes, void{}, binaryStringSearch) == null) {
+                    included_scopes = included_scopes ++ [_][]const u8{@tagName(scope_tag)};
+                }
             }
-            break :blk names;
-        },
+            break :included_scopes included_scopes;
+        } else null,
     };
     log_file_writer = .{
         .unbuffered_writer = .{
@@ -57,23 +58,30 @@ pub fn log(
     defer log_file_writer_mutex.unlock();
 
     const writer = log_file_writer.writer();
-    writer.writeAll(message_level.asText()) catch return;
-    if (scope != .default) {
-        writer.print("({s}): ", .{@tagName(scope)}) catch return;
-    } else writer.writeAll(": ") catch return;
+    const is_included_scope: bool = if (config.included_scopes) |scopes|
+        (std.sort.binarySearch([]const u8, @tagName(scope), scopes, void{}, binaryStringSearch) != null)
+    else
+        true;
 
-    if (std.sort.binarySearch([]const u8, @tagName(scope), config.stderr_excluded_scopes, void{}, struct {
-        fn compare(ctx: void, lhs: []const u8, rhs: []const u8) std.math.Order {
-            ctx;
-            return std.mem.order(u8, lhs, rhs);
-        }
-    }.compare) == null) {
+    if (scope == .default or is_included_scope) {
         if (config.stderr_level) |stderr_level| {
             if (@enumToInt(message_level) <= @enumToInt(stderr_level)) {
                 std.log.defaultLog(message_level, scope, format, args);
             }
         }
-    }
 
-    writer.print(format ++ "\n", args) catch return;
+        comptime var real_fmt: []const u8 = "";
+        comptime real_fmt = real_fmt ++ message_level.asText();
+        comptime if (scope != .default) {
+            real_fmt = real_fmt ++ "(" ++ @tagName(scope) ++ ")";
+        };
+        comptime real_fmt = real_fmt ++ ": " ++ format ++ "\n";
+
+        writer.print(real_fmt, args) catch return;
+    }
+}
+
+fn binaryStringSearch(ctx: void, lhs: []const u8, rhs: []const u8) std.math.Order {
+    ctx;
+    return std.mem.order(u8, lhs, rhs);
 }
