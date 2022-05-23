@@ -715,17 +715,15 @@ pub fn main() !void {
     };
 
     const vertices_bufmem: BufferAndDevMem = vertices_bufmem: {
-        const vertices_buffer: vk.Buffer = try device.dsp.createBuffer(device.handle, &vk.BufferCreateInfo{
-            .flags = vk.BufferCreateFlags{},
+        const vertices_buffer: vk.Buffer = try vkutil.createBuffer(allocator, device.dsp, device.handle, vkutil.BufferCreateInfo{
             .size = vertices.len * @sizeOf(Vertex),
 
             .usage = vk.BufferUsageFlags{ .vertex_buffer_bit = true },
             .sharing_mode = .exclusive,
 
-            .queue_family_index_count = 0,
-            .p_queue_family_indices = std.mem.span(&[_]u32{}).ptr,
-        }, &vkutil.allocCallbacksFrom(&allocator));
-        errdefer device.dsp.destroyBuffer(device.handle, vertices_buffer, &vkutil.allocCallbacksFrom(&allocator));
+            .queue_family_indices = &.{},
+        });
+        errdefer vkutil.destroyBuffer(allocator, device.dsp, device.handle, vertices_buffer);
 
         const requirements = device.dsp.getBufferMemoryRequirements(device.handle, vertices_buffer);
 
@@ -763,7 +761,7 @@ pub fn main() !void {
     };
     defer {
         device.dsp.freeMemory(device.handle, vertices_bufmem.devmem, &vkutil.allocCallbacksFrom(&allocator));
-        device.dsp.destroyBuffer(device.handle, vertices_bufmem.buffer, &vkutil.allocCallbacksFrom(&allocator));
+        vkutil.destroyBuffer(allocator, device.dsp, device.handle, vertices_bufmem.buffer);
     }
 
     init_vertices_mufmem: {

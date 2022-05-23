@@ -574,3 +574,41 @@ pub fn destroyImageView(
     comptime std.debug.assert(isDeviceWrapper(@TypeOf(device_dsp)));
     return device_dsp.destroyImageView(device, image_view, &vkutil.allocCallbacksFrom(&allocator));
 }
+
+pub const BufferCreateInfo = struct {
+    p_next: ?*const anyopaque = null,
+    flags: vk.BufferCreateFlags = .{},
+
+    size: vk.DeviceSize,
+    usage: vk.BufferUsageFlags,
+
+    sharing_mode: vk.SharingMode,
+    queue_family_indices: []const u32,
+};
+pub fn createBuffer(
+    allocator: std.mem.Allocator,
+    device_dsp: anytype,
+    device: vk.Device,
+    create_info: BufferCreateInfo,
+) @TypeOf(device_dsp).CreateBufferError!vk.Buffer {
+    return device_dsp.createBuffer(device, &vk.BufferCreateInfo{
+        .p_next = create_info.p_next,
+        .flags = create_info.flags,
+
+        .size = create_info.size,
+        .usage = create_info.usage,
+
+        .sharing_mode = create_info.sharing_mode,
+
+        .queue_family_index_count = @intCast(u32, create_info.queue_family_indices.len),
+        .p_queue_family_indices = create_info.queue_family_indices.ptr,
+    }, &vkutil.allocCallbacksFrom(&allocator));
+}
+pub fn destroyBuffer(
+    allocator: std.mem.Allocator,
+    device_dsp: anytype,
+    device: vk.Device,
+    buffer: vk.Buffer,
+) void {
+    return device_dsp.destroyBuffer(device, buffer, &vkutil.allocCallbacksFrom(&allocator));
+}
