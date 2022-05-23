@@ -706,40 +706,29 @@ pub fn main() !void {
         .{ .pos = Vertex.Pos{ .x = -0.5, .y = 0.5 }, .color = Vertex.Color{ .r = 0.0, .g = 0.0, .b = 1.0 } },
     };
 
-    const vertices_buffer: vk.Buffer = try vkutil.createBuffer(allocator, device.dsp, device.handle, vkutil.BufferCreateInfo{
-        .size = vertices.len * @sizeOf(Vertex),
+    const vertices_bufmem: BufAndMem = try BufAndMem.create(
+        allocator,
+        device,
+        inst.dsp.getPhysicalDeviceMemoryProperties(physical_device),
+        vk.MemoryPropertyFlags{
+            .host_visible_bit = true,
+            .host_coherent_bit = true,
+        },
+        vkutil.BufferCreateInfo{
+            .size = vertices.len * @sizeOf(Vertex),
 
-        .usage = vk.BufferUsageFlags{ .vertex_buffer_bit = true },
-        .sharing_mode = .exclusive,
+            .usage = vk.BufferUsageFlags{ .vertex_buffer_bit = true },
+            .sharing_mode = .exclusive,
 
-        .queue_family_indices = &.{},
-    });
-    defer vkutil.destroyBuffer(allocator, device.dsp, device.handle, vertices_buffer);
-
-    const vertices_devmem: vk.DeviceMemory = vertices_devmem: {
-        const requirements = device.dsp.getBufferMemoryRequirements(device.handle, vertices_buffer);
-        const memtype_index: u32 = memtype_index: {
-            const properties = inst.dsp.getPhysicalDeviceMemoryProperties(physical_device);
-            const memtypes: []const vk.MemoryType = properties.memory_types[0..properties.memory_type_count];
-
-            break :memtype_index selectMemoryTypeIndex(requirements.memory_type_bits, memtypes, vk.MemoryPropertyFlags{
-                .host_visible_bit = true,
-                .host_coherent_bit = true,
-            }) orelse return error.NoSuitableMemoryTypesOnSelectedPhysicalDevice;
-        };
-        break :vertices_devmem try vkutil.allocateMemory(allocator, device.dsp, device.handle, vk.MemoryAllocateInfo{
-            .allocation_size = requirements.size,
-            .memory_type_index = memtype_index,
-        });
-    };
-    defer vkutil.freeMemory(allocator, device.dsp, device.handle, vertices_devmem);
-
-    try device.dsp.bindBufferMemory(device.handle, vertices_buffer, vertices_devmem, 0);
+            .queue_family_indices = &.{},
+        },
+    );
+    defer vertices_bufmem.destroy(allocator, device);
     init_vertices_buffer: {
-        const requirements = device.dsp.getBufferMemoryRequirements(device.handle, vertices_buffer);
+        const requirements = device.dsp.getBufferMemoryRequirements(device.handle, vertices_bufmem.buf);
 
-        const mapped_memory = (try device.dsp.mapMemory(device.handle, vertices_devmem, 0, requirements.size, .{})).?;
-        defer device.dsp.unmapMemory(device.handle, vertices_devmem);
+        const mapped_memory = (try device.dsp.mapMemory(device.handle, vertices_bufmem.mem, 0, requirements.size, .{})).?;
+        defer device.dsp.unmapMemory(device.handle, vertices_bufmem.mem);
 
         std.mem.copy(u8, @ptrCast([*]u8, mapped_memory)[0 .. @sizeOf(Vertex) * vertices.len], std.mem.sliceAsBytes(std.mem.span(&vertices)));
         break :init_vertices_buffer;
@@ -1257,7 +1246,7 @@ pub fn main() !void {
                 }, .@"inline");
 
                 device.dsp.cmdBindPipeline(cmdbuffer, .graphics, graphics_pipeline);
-                device.dsp.cmdBindVertexBuffers(cmdbuffer, 0, 1, &[_]vk.Buffer{vertices_buffer}, &[_]vk.DeviceSize{0});
+                device.dsp.cmdBindVertexBuffers(cmdbuffer, 0, 1, &[_]vk.Buffer{vertices_bufmem.buf}, &[_]vk.DeviceSize{0});
                 device.dsp.cmdDraw(cmdbuffer, vertices.len, 1, 0, 0);
 
                 device.dsp.cmdEndRenderPass(cmdbuffer);
@@ -1300,15 +1289,47 @@ pub fn main() !void {
     }
 }
 
-fn selectMemoryTypeIndex(
-    memory_type_bits: u32,
-    memory_types: []const vk.MemoryType,
-    min_required_flags: vk.MemoryPropertyFlags,
-) ?u32 {
-    for (memory_types) |memtype, memtype_index| {
-        if (memory_type_bits & std.math.shl(u32, 1, memtype_index) == 0) continue;
-        if (!memtype.property_flags.contains(min_required_flags)) continue;
-        return @intCast(u32, memtype_index);
+const BufAndMem = struct {
+    buf: vk.Buffer,
+    mem: vk.DeviceMemory,
+
+    fn create(
+        allocator: std.mem.Allocator,
+        device: VulkanDevice,
+        physical_device_properties: vk.PhysicalDeviceMemoryProperties,
+        min_required_flags: vk.MemoryPropertyFlags,
+        buf_create_info: vkutil.BufferCreateInfo,
+    ) !BufAndMem {
+        const buf: vk.Buffer = try vkutil.createBuffer(allocator, device.dsp, device.handle, buf_create_info);
+        errdefer vkutil.destroyBuffer(allocator, device.dsp, device.handle, buf);
+
+        const mem: vk.DeviceMemory = mem: {
+            const requirements = device.dsp.getBufferMemoryRequirements(device.handle, buf);
+            const memtype_index: u32 = memtype_index: {
+                const memtypes: []const vk.MemoryType = physical_device_properties.memory_types[0..physical_device_properties.memory_type_count];
+                for (memtypes) |memtype, memtype_index| {
+                    if (requirements.memory_type_bits & std.math.shl(u32, 1, memtype_index) == 0) continue;
+                    if (!memtype.property_flags.contains(min_required_flags)) continue;
+                    break :memtype_index @intCast(u32, memtype_index);
+                }
+                return error.NoSuitableMemoryTypesOnSelectedPhysicalDevice;
+            };
+            break :mem try vkutil.allocateMemory(allocator, device.dsp, device.handle, vk.MemoryAllocateInfo{
+                .allocation_size = requirements.size,
+                .memory_type_index = memtype_index,
+            });
+        };
+        errdefer vkutil.freeMemory(allocator, device.dsp, device.handle, mem);
+
+        try device.dsp.bindBufferMemory(device.handle, buf, mem, 0);
+        return BufAndMem{
+            .buf = buf,
+            .mem = mem,
+        };
     }
-    return null;
-}
+
+    fn destroy(self: BufAndMem, allocator: std.mem.Allocator, device: VulkanDevice) void {
+        vkutil.freeMemory(allocator, device.dsp, device.handle, self.mem);
+        vkutil.destroyBuffer(allocator, device.dsp, device.handle, self.buf);
+    }
+};
