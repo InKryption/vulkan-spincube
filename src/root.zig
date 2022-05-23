@@ -437,6 +437,7 @@ pub fn main() !void {
     };
     var window_data: WindowData = .{};
     window.setUserPointer(&window_data);
+    defer window.setUserPointer(null);
 
     window.setFocusCallback(struct {
         fn focusCallback(wnd: glfw.Window, focused: bool) void {
@@ -1172,7 +1173,7 @@ pub fn main() !void {
         try glfw.pollEvents();
 
         if (!window_data.we_are_in_focus) continue;
-        ensure_framebuffer_compat: {
+        handle_framebuffer_resizes: {
             const fbsize: vk.Extent2D = fbsize: {
                 const fbsize = try window.getFramebufferSize();
                 break :fbsize vk.Extent2D{
@@ -1199,7 +1200,7 @@ pub fn main() !void {
                 try swapchain.populateFramebuffers(allocator, device, graphics_render_pass, swapchain_framebuffers.items);
             }
 
-            break :ensure_framebuffer_compat;
+            break :handle_framebuffer_resizes;
         }
 
         draw_frame: {
