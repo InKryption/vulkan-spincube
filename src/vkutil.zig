@@ -612,3 +612,20 @@ pub fn destroyBuffer(
 ) void {
     return device_dsp.destroyBuffer(device, buffer, &vkutil.allocCallbacksFrom(&allocator));
 }
+
+pub fn allocateMemory(
+    allocator: std.mem.Allocator,
+    device_dsp: anytype,
+    device: vk.Device,
+    allocate_info: vk.MemoryAllocateInfo,
+) @TypeOf(device_dsp).AllocateMemoryError!vk.DeviceMemory {
+    return device_dsp.allocateMemory(device, &allocate_info, &vkutil.allocCallbacksFrom(&allocator));
+}
+pub fn freeMemory(
+    allocator: std.mem.Allocator,
+    device_dsp: anytype,
+    device: vk.Device,
+    memory: vk.DeviceMemory,
+) void {
+    return device_dsp.freeMemory(device, memory, &vkutil.allocCallbacksFrom(&allocator));
+}

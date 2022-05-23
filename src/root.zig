@@ -438,7 +438,6 @@ pub fn main() !void {
     var window_data: WindowData = .{};
     window.setUserPointer(&window_data);
     defer window.setUserPointer(null);
-
     window.setFocusCallback(struct {
         fn focusCallback(wnd: glfw.Window, focused: bool) void {
             const user_data = wnd.getUserPointer(WindowData).?;
@@ -707,69 +706,43 @@ pub fn main() !void {
         .{ .pos = Vertex.Pos{ .x = -0.5, .y = 0.5 }, .color = Vertex.Color{ .r = 0.0, .g = 0.0, .b = 1.0 } },
     };
 
-    const BufferAndDevMem = struct {
-        buffer: vk.Buffer,
-        devmem: vk.DeviceMemory,
-        offset: vk.DeviceSize,
-        size: vk.DeviceSize,
-    };
+    const vertices_buffer: vk.Buffer = try vkutil.createBuffer(allocator, device.dsp, device.handle, vkutil.BufferCreateInfo{
+        .size = vertices.len * @sizeOf(Vertex),
 
-    const vertices_bufmem: BufferAndDevMem = vertices_bufmem: {
-        const vertices_buffer: vk.Buffer = try vkutil.createBuffer(allocator, device.dsp, device.handle, vkutil.BufferCreateInfo{
-            .size = vertices.len * @sizeOf(Vertex),
+        .usage = vk.BufferUsageFlags{ .vertex_buffer_bit = true },
+        .sharing_mode = .exclusive,
 
-            .usage = vk.BufferUsageFlags{ .vertex_buffer_bit = true },
-            .sharing_mode = .exclusive,
+        .queue_family_indices = &.{},
+    });
+    defer vkutil.destroyBuffer(allocator, device.dsp, device.handle, vertices_buffer);
 
-            .queue_family_indices = &.{},
+    const vertices_devmem: vk.DeviceMemory = vertices_devmem: {
+        const requirements = device.dsp.getBufferMemoryRequirements(device.handle, vertices_buffer);
+        const memtype_index: u32 = memtype_index: {
+            const properties = inst.dsp.getPhysicalDeviceMemoryProperties(physical_device);
+            const memtypes: []const vk.MemoryType = properties.memory_types[0..properties.memory_type_count];
+
+            break :memtype_index selectMemoryTypeIndex(requirements.memory_type_bits, memtypes, vk.MemoryPropertyFlags{
+                .host_visible_bit = true,
+                .host_coherent_bit = true,
+            }) orelse return error.NoSuitableMemoryTypesOnSelectedPhysicalDevice;
+        };
+        break :vertices_devmem try vkutil.allocateMemory(allocator, device.dsp, device.handle, vk.MemoryAllocateInfo{
+            .allocation_size = requirements.size,
+            .memory_type_index = memtype_index,
         });
-        errdefer vkutil.destroyBuffer(allocator, device.dsp, device.handle, vertices_buffer);
+    };
+    defer vkutil.freeMemory(allocator, device.dsp, device.handle, vertices_devmem);
 
+    try device.dsp.bindBufferMemory(device.handle, vertices_buffer, vertices_devmem, 0);
+    init_vertices_buffer: {
         const requirements = device.dsp.getBufferMemoryRequirements(device.handle, vertices_buffer);
 
-        const vertices_buffer_memory: vk.DeviceMemory = vertices_buffer_memory: {
-            const required_memory_type: u32 = requirements.memory_type_bits;
-
-            const selected_memory_type_index: u32 = selected_memory_type_index: {
-                const properties = inst.dsp.getPhysicalDeviceMemoryProperties(physical_device);
-                const available_memory_types: []const vk.MemoryType = properties.memory_types[0..properties.memory_type_count];
-                for (available_memory_types) |mem_type, i| {
-                    if ((required_memory_type & std.math.shl(u32, 1, i) != 0) and mem_type.property_flags.contains(.{
-                        .host_visible_bit = true,
-                        .host_coherent_bit = true,
-                    })) {
-                        break :selected_memory_type_index @intCast(u32, i);
-                    }
-                }
-                return error.NoSuitableMemoryTypesOnSelectedPhysicalDevice;
-            };
-
-            break :vertices_buffer_memory try device.dsp.allocateMemory(device.handle, &vk.MemoryAllocateInfo{
-                .allocation_size = requirements.size,
-                .memory_type_index = selected_memory_type_index,
-            }, &vkutil.allocCallbacksFrom(&allocator));
-        };
-        errdefer device.dsp.freeMemory(device.handle, vertices_buffer_memory, &vkutil.allocCallbacksFrom(&allocator));
-
-        try device.dsp.bindBufferMemory(device.handle, vertices_buffer, vertices_buffer_memory, 0);
-        break :vertices_bufmem BufferAndDevMem{
-            .buffer = vertices_buffer,
-            .devmem = vertices_buffer_memory,
-            .offset = 0,
-            .size = requirements.size,
-        };
-    };
-    defer {
-        device.dsp.freeMemory(device.handle, vertices_bufmem.devmem, &vkutil.allocCallbacksFrom(&allocator));
-        vkutil.destroyBuffer(allocator, device.dsp, device.handle, vertices_bufmem.buffer);
-    }
-
-    init_vertices_mufmem: {
-        const mapped_memory = (try device.dsp.mapMemory(device.handle, vertices_bufmem.devmem, 0, vertices_bufmem.size, .{})).?;
-        defer device.dsp.unmapMemory(device.handle, vertices_bufmem.devmem);
+        const mapped_memory = (try device.dsp.mapMemory(device.handle, vertices_devmem, 0, requirements.size, .{})).?;
+        defer device.dsp.unmapMemory(device.handle, vertices_devmem);
 
         std.mem.copy(u8, @ptrCast([*]u8, mapped_memory)[0 .. @sizeOf(Vertex) * vertices.len], std.mem.sliceAsBytes(std.mem.span(&vertices)));
-        break :init_vertices_mufmem;
+        break :init_vertices_buffer;
     }
 
     const graphics_pipeline_layout: vk.PipelineLayout = graphics_pipeline_layout: {
@@ -1284,7 +1257,7 @@ pub fn main() !void {
                 }, .@"inline");
 
                 device.dsp.cmdBindPipeline(cmdbuffer, .graphics, graphics_pipeline);
-                device.dsp.cmdBindVertexBuffers(cmdbuffer, 0, 1, &[_]vk.Buffer{vertices_bufmem.buffer}, &[_]vk.DeviceSize{vertices_bufmem.offset});
+                device.dsp.cmdBindVertexBuffers(cmdbuffer, 0, 1, &[_]vk.Buffer{vertices_buffer}, &[_]vk.DeviceSize{0});
                 device.dsp.cmdDraw(cmdbuffer, vertices.len, 1, 0, 0);
 
                 device.dsp.cmdEndRenderPass(cmdbuffer);
@@ -1325,4 +1298,17 @@ pub fn main() !void {
             break :draw_frame;
         }
     }
+}
+
+fn selectMemoryTypeIndex(
+    memory_type_bits: u32,
+    memory_types: []const vk.MemoryType,
+    min_required_flags: vk.MemoryPropertyFlags,
+) ?u32 {
+    for (memory_types) |memtype, memtype_index| {
+        if (memory_type_bits & std.math.shl(u32, 1, memtype_index) == 0) continue;
+        if (!memtype.property_flags.contains(min_required_flags)) continue;
+        return @intCast(u32, memtype_index);
+    }
+    return null;
 }
