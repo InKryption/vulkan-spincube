@@ -377,13 +377,15 @@ const DeviceDispatch = vk.DeviceWrapper(vk.DeviceCommandFlags{
     .allocateCommandBuffers = true,
     .freeCommandBuffers = true,
 
+    .queueSubmit = true,
+    .queuePresentKHR = true,
+
     .beginCommandBuffer = true,
     .endCommandBuffer = true,
     .resetCommandBuffer = true,
 
-    .queueSubmit = true,
-    .queuePresentKHR = true,
-
+    .cmdSetViewport = true,
+    .cmdSetScissor = true,
     .cmdBeginRenderPass = true,
     .cmdEndRenderPass = true,
     .cmdBindPipeline = true,
@@ -429,6 +431,19 @@ pub fn main() !void {
 
     const window = try glfw.Window.create(600, 600, "vulkan-spincube", null, null, glfw.Window.Hints{ .client_api = .no_api });
     defer window.destroy();
+
+    const WindowData = struct {
+        we_are_in_focus: bool = true,
+    };
+    var window_data: WindowData = .{};
+    window.setUserPointer(&window_data);
+
+    window.setFocusCallback(struct {
+        fn focusCallback(wnd: glfw.Window, focused: bool) void {
+            const user_data = wnd.getUserPointer(WindowData).?;
+            user_data.we_are_in_focus = focused;
+        }
+    }.focusCallback);
 
     const debug_messenger_create_info = if (build_options.vk_validation_layers) vk.DebugUtilsMessengerCreateInfoEXT{
         .flags = .{},
@@ -959,8 +974,8 @@ pub fn main() !void {
         };
 
         const dynamic_states = [_]vk.DynamicState{
-            // .viewport,
-            // .line_width,
+            .viewport,
+            .scissor,
         };
 
         const vertex_binding_descriptions = [_]vk.VertexInputBindingDescription{
@@ -1155,6 +1170,8 @@ pub fn main() !void {
     defer device.dsp.deviceWaitIdle(device.handle) catch |err| std.log.err("deviceWaitIdle: {s}", .{@errorName(err)});
     mainloop: while (!window.shouldClose()) {
         try glfw.pollEvents();
+
+        if (!window_data.we_are_in_focus) continue;
         ensure_framebuffer_compat: {
             const fbsize: vk.Extent2D = fbsize: {
                 const fbsize = try window.getFramebufferSize();
@@ -1231,6 +1248,23 @@ pub fn main() !void {
                     .p_inheritance_info = null,
                 });
 
+                device.dsp.cmdSetViewport(cmdbuffer, 0, 1, &[_]vk.Viewport{
+                    .{
+                        .x = 0.0,
+                        .y = 0.0,
+                        .width = @intToFloat(f32, swapchain.details.extent.width),
+                        .height = @intToFloat(f32, swapchain.details.extent.height),
+                        .min_depth = 0.0,
+                        .max_depth = 0.0,
+                    },
+                });
+                device.dsp.cmdSetScissor(cmdbuffer, 0, 1, &[_]vk.Rect2D{
+                    .{
+                        .offset = vk.Offset2D{ .x = 0, .y = 0 },
+                        .extent = swapchain.details.extent,
+                    },
+                });
+
                 device.dsp.cmdBeginRenderPass(cmdbuffer, &vk.RenderPassBeginInfo{
                     .render_pass = graphics_render_pass,
                     .framebuffer = swapchain_framebuffers.items[image_index],
@@ -1286,7 +1320,7 @@ pub fn main() !void {
                 .p_results = @as(?[*]vk.Result, null),
             })) |result| switch (result) {
                 .success => {},
-                else => std.log.warn("queuePresentKHR: {s}.", .{@tagName(result)}),
+                else => std.log.info("queuePresentKHR: {s}.", .{@tagName(result)}),
             } else |err| return err;
 
             break :draw_frame;
