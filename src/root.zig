@@ -634,7 +634,7 @@ pub fn main() !void {
         inst.handle,
         debug_messenger_create_info,
     ) else void{};
-    defer vkutil.destroyDebugUtilsMessengerEXT(allocator, inst.dsp, inst.handle, debug_messenger);
+    defer if (build_options.vk_validation_layers) vkutil.destroyDebugUtilsMessengerEXT(allocator, inst.dsp, inst.handle, debug_messenger);
 
     const physical_device: vk.PhysicalDevice = physical_device: {
         const all_physical_devices: []const vk.PhysicalDevice = try vkutil.enumeratePhysicalDevicesAlloc(allocator, inst.dsp, inst.handle);
@@ -691,7 +691,10 @@ pub fn main() !void {
         const result = try glfw.createWindowSurface(inst.handle, window, @as(?*const vk.AllocationCallbacks, &vkutil.allocCallbacksFrom(&allocator)), &window_surface);
         switch (@intToEnum(vk.Result, result)) {
             .success => {},
-            else => std.debug.todo(""),
+            .error_extension_not_present => unreachable,
+            .error_native_window_in_use_khr => unreachable,
+            .error_initialization_failed => return error.GlfwVulkanInitialisationFailed,
+            else => unreachable,
         }
         break :window_surface window_surface;
     };
@@ -1301,6 +1304,11 @@ pub fn main() !void {
         break :init_vertices_buffer;
     }
 
+    const in_flight_slice: []const vk.Fence = syncronized_frames.items(.in_flight);
+    const image_available_slice: []const vk.Semaphore = syncronized_frames.items(.image_available);
+    const render_finished_slice: []const vk.Semaphore = syncronized_frames.items(.render_finished);
+    const cmdbuffer_slice: []const vk.CommandBuffer = syncronized_frames.items(.cmdbuffer);
+
     var current_frame: u32 = 0;
     defer device.dsp.deviceWaitIdle(device.handle) catch |err| std.log.err("deviceWaitIdle: {s}", .{@errorName(err)});
     mainloop: while (!window.shouldClose()) {
@@ -1338,10 +1346,10 @@ pub fn main() !void {
         }
 
         draw_frame: {
-            const in_flight: vk.Fence = syncronized_frames.items(.in_flight)[current_frame];
-            const image_available: vk.Semaphore = syncronized_frames.items(.image_available)[current_frame];
-            const render_finished: vk.Semaphore = syncronized_frames.items(.render_finished)[current_frame];
-            const cmdbuffer: vk.CommandBuffer = syncronized_frames.items(.cmdbuffer)[current_frame];
+            const in_flight: vk.Fence = in_flight_slice[current_frame];
+            const image_available: vk.Semaphore = image_available_slice[current_frame];
+            const render_finished: vk.Semaphore = render_finished_slice[current_frame];
+            const cmdbuffer: vk.CommandBuffer = cmdbuffer_slice[current_frame];
             current_frame = (current_frame + 1) % max_frames_in_flight;
 
             if (device.dsp.waitForFences(device.handle, 1, @ptrCast(*const [1]vk.Fence, &in_flight), vk.TRUE, std.math.maxInt(u64))) |result| {
@@ -1370,7 +1378,7 @@ pub fn main() !void {
 
                 else => unreachable,
             } else |err| switch (err) {
-                error.OutOfDateKHR => std.debug.todo(""),
+                error.OutOfDateKHR => continue :mainloop,
                 else => return err,
             };
 
