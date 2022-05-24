@@ -276,13 +276,18 @@ const BufAndMem = struct {
     buf: vk.Buffer,
     mem: vk.DeviceMemory,
 
+    const DeviceErrors = DeviceDispatch.CreateBufferError || DeviceDispatch.AllocateMemoryError || DeviceDispatch.BindBufferMemoryError;
+    const CreateError = DeviceErrors || error{
+        NoSuitableMemoryTypesOnSelectedPhysicalDevice,
+    };
+
     fn create(
         allocator: std.mem.Allocator,
         device: VulkanDevice,
         physical_device_properties: vk.PhysicalDeviceMemoryProperties,
         min_required_flags: vk.MemoryPropertyFlags,
         buf_create_info: vkutil.BufferCreateInfo,
-    ) !BufAndMem {
+    ) BufAndMem.CreateError!BufAndMem {
         const buf: vk.Buffer = try vkutil.createBuffer(allocator, device.dsp, device.handle, buf_create_info);
         errdefer vkutil.destroyBuffer(allocator, device.dsp, device.handle, buf);
 
@@ -422,6 +427,7 @@ const DeviceDispatch = vk.DeviceWrapper(vk.DeviceCommandFlags{
     .freeCommandBuffers = true,
 
     .queueSubmit = true,
+    .queueWaitIdle = true,
     .queuePresentKHR = true,
 
     .beginCommandBuffer = true,
@@ -430,6 +436,7 @@ const DeviceDispatch = vk.DeviceWrapper(vk.DeviceCommandFlags{
 
     .cmdSetViewport = true,
     .cmdSetScissor = true,
+    .cmdCopyBuffer = true,
     .cmdBeginRenderPass = true,
     .cmdEndRenderPass = true,
     .cmdBindPipeline = true,
@@ -459,8 +466,6 @@ fn getInstanceProcAddress(handle: vk.Instance, name: [*:0]const u8) ?*const anyo
 const file_logger = @import("file_logger.zig");
 pub const log = file_logger.log;
 pub const log_level: std.log.Level = std.enums.nameCast(std.log.Level, build_options.log_level);
-
-
 
 const max_frames_in_flight = 2;
 pub fn main() !void {
@@ -745,40 +750,6 @@ pub fn main() !void {
         });
     };
     defer swapchain.destroy(allocator, device);
-
-    const vertices = [3]Vertex{
-        .{ .pos = Vertex.Pos{ .x = 0.0, .y = -0.5 }, .color = Vertex.Color{ .r = 1.0, .g = 0.0, .b = 0.0 } },
-        .{ .pos = Vertex.Pos{ .x = 0.5, .y = 0.5 }, .color = Vertex.Color{ .r = 0.0, .g = 1.0, .b = 0.0 } },
-        .{ .pos = Vertex.Pos{ .x = -0.5, .y = 0.5 }, .color = Vertex.Color{ .r = 0.0, .g = 0.0, .b = 1.0 } },
-    };
-
-    const vertices_bufmem: BufAndMem = try BufAndMem.create(
-        allocator,
-        device,
-        inst.dsp.getPhysicalDeviceMemoryProperties(physical_device),
-        vk.MemoryPropertyFlags{
-            .host_visible_bit = true,
-            .host_coherent_bit = true,
-        },
-        vkutil.BufferCreateInfo{
-            .size = vertices.len * @sizeOf(Vertex),
-
-            .usage = vk.BufferUsageFlags{ .vertex_buffer_bit = true },
-            .sharing_mode = .exclusive,
-
-            .queue_family_indices = &.{},
-        },
-    );
-    defer vertices_bufmem.destroy(allocator, device);
-    init_vertices_buffer: {
-        const requirements = device.dsp.getBufferMemoryRequirements(device.handle, vertices_bufmem.buf);
-
-        const mapped_memory = (try device.dsp.mapMemory(device.handle, vertices_bufmem.mem, 0, requirements.size, .{})).?;
-        defer device.dsp.unmapMemory(device.handle, vertices_bufmem.mem);
-
-        std.mem.copy(u8, @ptrCast([*]u8, mapped_memory)[0 .. @sizeOf(Vertex) * vertices.len], std.mem.sliceAsBytes(std.mem.span(&vertices)));
-        break :init_vertices_buffer;
-    }
 
     const graphics_pipeline_layout: vk.PipelineLayout = graphics_pipeline_layout: {
         const set_layouts = [_]vk.DescriptorSetLayout{};
@@ -1072,11 +1043,17 @@ pub fn main() !void {
         swapchain_framebuffers.deinit();
     }
 
-    const cmdpool: vk.CommandPool = try device.dsp.createCommandPool(device.handle, &vk.CommandPoolCreateInfo{
+    const drawing_cmdpool: vk.CommandPool = try device.dsp.createCommandPool(device.handle, &vk.CommandPoolCreateInfo{
         .flags = vk.CommandPoolCreateFlags{ .reset_command_buffer_bit = true },
         .queue_family_index = core_qfi.graphics,
     }, &vkutil.allocCallbacksFrom(&allocator));
-    defer device.dsp.destroyCommandPool(device.handle, cmdpool, &vkutil.allocCallbacksFrom(&allocator));
+    defer device.dsp.destroyCommandPool(device.handle, drawing_cmdpool, &vkutil.allocCallbacksFrom(&allocator));
+
+    const copying_cmdpool: vk.CommandPool = try device.dsp.createCommandPool(device.handle, &vk.CommandPoolCreateInfo{
+        .flags = vk.CommandPoolCreateFlags{ .transient_bit = true },
+        .queue_family_index = core_qfi.graphics,
+    }, &vkutil.allocCallbacksFrom(&allocator));
+    defer device.dsp.destroyCommandPool(device.handle, copying_cmdpool, &vkutil.allocCallbacksFrom(&allocator));
 
     const SyncronizedFrame = struct {
         cmdbuffer: vk.CommandBuffer,
@@ -1096,13 +1073,13 @@ pub fn main() !void {
         }
 
         try device.dsp.allocateCommandBuffers(device.handle, &vk.CommandBufferAllocateInfo{
-            .command_pool = cmdpool,
+            .command_pool = drawing_cmdpool,
             .level = .primary,
             .command_buffer_count = @intCast(u32, syncronized_frames.len),
         }, syncronized_frames.items(.cmdbuffer).ptr);
         errdefer device.dsp.freeCommandBuffers(
             device.handle,
-            cmdpool,
+            drawing_cmdpool,
             @intCast(u32, syncronized_frames.len),
             syncronized_frames.items(.cmdbuffer).ptr,
         );
@@ -1167,10 +1144,104 @@ pub fn main() !void {
             device.dsp.destroyFence(device.handle, fence, &vkutil.allocCallbacksFrom(&allocator));
         }
 
-        device.dsp.freeCommandBuffers(device.handle, cmdpool, @intCast(u32, syncronized_frames.len), syncronized_frames.items(.cmdbuffer).ptr);
+        device.dsp.freeCommandBuffers(device.handle, drawing_cmdpool, @intCast(u32, syncronized_frames.len), syncronized_frames.items(.cmdbuffer).ptr);
 
         var copy = syncronized_frames;
         copy.deinit(allocator);
+    }
+
+    const vertices = [3]Vertex{
+        .{ .pos = Vertex.Pos{ .x = 0.0, .y = -0.5 }, .color = Vertex.Color{ .r = 1.0, .g = 0.0, .b = 0.0 } },
+        .{ .pos = Vertex.Pos{ .x = 0.5, .y = 0.5 }, .color = Vertex.Color{ .r = 0.0, .g = 1.0, .b = 0.0 } },
+        .{ .pos = Vertex.Pos{ .x = -0.5, .y = 0.5 }, .color = Vertex.Color{ .r = 0.0, .g = 0.0, .b = 1.0 } },
+    };
+
+    const vertices_bufmem: BufAndMem = try BufAndMem.create(
+        allocator,
+        device,
+        inst.dsp.getPhysicalDeviceMemoryProperties(physical_device),
+        vk.MemoryPropertyFlags{
+            .device_local_bit = true,
+        },
+        vkutil.BufferCreateInfo{
+            .size = vertices.len * @sizeOf(Vertex),
+            .usage = vk.BufferUsageFlags{
+                .vertex_buffer_bit = true,
+                .transfer_dst_bit = true,
+            },
+
+            .sharing_mode = .exclusive,
+            .queue_family_indices = &.{},
+        },
+    );
+    defer vertices_bufmem.destroy(allocator, device);
+
+    init_vertices_buffer: {
+        const requirements = device.dsp.getBufferMemoryRequirements(device.handle, vertices_bufmem.buf);
+
+        const staging_bufmem: BufAndMem = try BufAndMem.create(
+            allocator,
+            device,
+            inst.dsp.getPhysicalDeviceMemoryProperties(physical_device),
+            vk.MemoryPropertyFlags{
+                .host_visible_bit = true,
+                .host_coherent_bit = true,
+            },
+            vkutil.BufferCreateInfo{
+                .size = vertices.len * @sizeOf(Vertex),
+                .usage = vk.BufferUsageFlags{
+                    .vertex_buffer_bit = true,
+                    .transfer_src_bit = true,
+                },
+
+                .sharing_mode = .exclusive,
+                .queue_family_indices = &.{},
+            },
+        );
+        defer staging_bufmem.destroy(allocator, device);
+
+        init_staging_buffer: {
+            const mapped_memory = (try device.dsp.mapMemory(device.handle, staging_bufmem.mem, 0, requirements.size, .{})).?;
+            defer device.dsp.unmapMemory(device.handle, staging_bufmem.mem);
+
+            std.mem.copy(u8, @ptrCast([*]u8, mapped_memory)[0 .. @sizeOf(Vertex) * vertices.len], std.mem.sliceAsBytes(std.mem.span(&vertices)));
+            break :init_staging_buffer;
+        }
+
+        var copy_cmdbuffer: vk.CommandBuffer = .null_handle;
+        try device.dsp.allocateCommandBuffers(device.handle, &vk.CommandBufferAllocateInfo{
+            .command_pool = copying_cmdpool,
+            .level = .primary,
+            .command_buffer_count = 1,
+        }, @ptrCast(*[1]vk.CommandBuffer, &copy_cmdbuffer));
+        defer device.dsp.freeCommandBuffers(device.handle, copying_cmdpool, 1, @ptrCast(*const [1]vk.CommandBuffer, &copy_cmdbuffer));
+
+        try device.dsp.beginCommandBuffer(copy_cmdbuffer, &vk.CommandBufferBeginInfo{
+            .flags = vk.CommandBufferUsageFlags{ .one_time_submit_bit = true },
+            .p_inheritance_info = null,
+        });
+        device.dsp.cmdCopyBuffer(copy_cmdbuffer, staging_bufmem.buf, vertices_bufmem.buf, 1, &[_]vk.BufferCopy{.{
+            .src_offset = 0,
+            .dst_offset = 0,
+            .size = vertices.len * @sizeOf(Vertex),
+        }});
+        try device.dsp.endCommandBuffer(copy_cmdbuffer);
+
+        try device.dsp.queueSubmit(device.dsp.getDeviceQueue(device.handle, core_qfi.graphics, 0), 1, &[_]vk.SubmitInfo{.{
+            .wait_semaphore_count = @intCast(u32, 0),
+            .p_wait_semaphores = std.mem.span(&[_]vk.Semaphore{}).ptr,
+            .p_wait_dst_stage_mask = std.mem.span(&[_]vk.PipelineStageFlags{}).ptr,
+
+            .command_buffer_count = 1,
+            .p_command_buffers = &[_]vk.CommandBuffer{copy_cmdbuffer},
+
+            .signal_semaphore_count = @intCast(u32, 0),
+            .p_signal_semaphores = std.mem.span(&[_]vk.Semaphore{}).ptr,
+        }}, .null_handle);
+        try device.dsp.queueWaitIdle(device.dsp.getDeviceQueue(device.handle, core_qfi.graphics, 0));
+        
+
+        break :init_vertices_buffer;
     }
 
     var current_frame: u32 = 0;
@@ -1328,7 +1399,10 @@ pub fn main() !void {
             })) |result| switch (result) {
                 .success => {},
                 else => std.log.info("queuePresentKHR: {s}.", .{@tagName(result)}),
-            } else |err| return err;
+            } else |err| switch (err) {
+                error.OutOfDateKHR => continue,
+                else => return err,
+            }
 
             break :draw_frame;
         }
