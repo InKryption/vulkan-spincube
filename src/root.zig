@@ -272,6 +272,50 @@ const Swapchain = struct {
         slice.* = swapchain_images.toOwnedSlice();
     }
 };
+const BufAndMem = struct {
+    buf: vk.Buffer,
+    mem: vk.DeviceMemory,
+
+    fn create(
+        allocator: std.mem.Allocator,
+        device: VulkanDevice,
+        physical_device_properties: vk.PhysicalDeviceMemoryProperties,
+        min_required_flags: vk.MemoryPropertyFlags,
+        buf_create_info: vkutil.BufferCreateInfo,
+    ) !BufAndMem {
+        const buf: vk.Buffer = try vkutil.createBuffer(allocator, device.dsp, device.handle, buf_create_info);
+        errdefer vkutil.destroyBuffer(allocator, device.dsp, device.handle, buf);
+
+        const mem: vk.DeviceMemory = mem: {
+            const requirements = device.dsp.getBufferMemoryRequirements(device.handle, buf);
+            const memtype_index: u32 = memtype_index: {
+                const memtypes: []const vk.MemoryType = physical_device_properties.memory_types[0..physical_device_properties.memory_type_count];
+                for (memtypes) |memtype, memtype_index| {
+                    if (requirements.memory_type_bits & std.math.shl(u32, 1, memtype_index) == 0) continue;
+                    if (!memtype.property_flags.contains(min_required_flags)) continue;
+                    break :memtype_index @intCast(u32, memtype_index);
+                }
+                return error.NoSuitableMemoryTypesOnSelectedPhysicalDevice;
+            };
+            break :mem try vkutil.allocateMemory(allocator, device.dsp, device.handle, vk.MemoryAllocateInfo{
+                .allocation_size = requirements.size,
+                .memory_type_index = memtype_index,
+            });
+        };
+        errdefer vkutil.freeMemory(allocator, device.dsp, device.handle, mem);
+
+        try device.dsp.bindBufferMemory(device.handle, buf, mem, 0);
+        return BufAndMem{
+            .buf = buf,
+            .mem = mem,
+        };
+    }
+
+    fn destroy(self: BufAndMem, allocator: std.mem.Allocator, device: VulkanDevice) void {
+        vkutil.freeMemory(allocator, device.dsp, device.handle, self.mem);
+        vkutil.destroyBuffer(allocator, device.dsp, device.handle, self.buf);
+    }
+};
 
 const Vertex = extern struct {
     pos: Pos,
@@ -415,6 +459,8 @@ fn getInstanceProcAddress(handle: vk.Instance, name: [*:0]const u8) ?*const anyo
 const file_logger = @import("file_logger.zig");
 pub const log = file_logger.log;
 pub const log_level: std.log.Level = std.enums.nameCast(std.log.Level, build_options.log_level);
+
+
 
 const max_frames_in_flight = 2;
 pub fn main() !void {
@@ -1288,48 +1334,3 @@ pub fn main() !void {
         }
     }
 }
-
-const BufAndMem = struct {
-    buf: vk.Buffer,
-    mem: vk.DeviceMemory,
-
-    fn create(
-        allocator: std.mem.Allocator,
-        device: VulkanDevice,
-        physical_device_properties: vk.PhysicalDeviceMemoryProperties,
-        min_required_flags: vk.MemoryPropertyFlags,
-        buf_create_info: vkutil.BufferCreateInfo,
-    ) !BufAndMem {
-        const buf: vk.Buffer = try vkutil.createBuffer(allocator, device.dsp, device.handle, buf_create_info);
-        errdefer vkutil.destroyBuffer(allocator, device.dsp, device.handle, buf);
-
-        const mem: vk.DeviceMemory = mem: {
-            const requirements = device.dsp.getBufferMemoryRequirements(device.handle, buf);
-            const memtype_index: u32 = memtype_index: {
-                const memtypes: []const vk.MemoryType = physical_device_properties.memory_types[0..physical_device_properties.memory_type_count];
-                for (memtypes) |memtype, memtype_index| {
-                    if (requirements.memory_type_bits & std.math.shl(u32, 1, memtype_index) == 0) continue;
-                    if (!memtype.property_flags.contains(min_required_flags)) continue;
-                    break :memtype_index @intCast(u32, memtype_index);
-                }
-                return error.NoSuitableMemoryTypesOnSelectedPhysicalDevice;
-            };
-            break :mem try vkutil.allocateMemory(allocator, device.dsp, device.handle, vk.MemoryAllocateInfo{
-                .allocation_size = requirements.size,
-                .memory_type_index = memtype_index,
-            });
-        };
-        errdefer vkutil.freeMemory(allocator, device.dsp, device.handle, mem);
-
-        try device.dsp.bindBufferMemory(device.handle, buf, mem, 0);
-        return BufAndMem{
-            .buf = buf,
-            .mem = mem,
-        };
-    }
-
-    fn destroy(self: BufAndMem, allocator: std.mem.Allocator, device: VulkanDevice) void {
-        vkutil.freeMemory(allocator, device.dsp, device.handle, self.mem);
-        vkutil.destroyBuffer(allocator, device.dsp, device.handle, self.buf);
-    }
-};
