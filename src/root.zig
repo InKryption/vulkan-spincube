@@ -468,6 +468,22 @@ pub const log = file_logger.log;
 pub const log_level: std.log.Level = std.enums.nameCast(std.log.Level, build_options.log_level);
 
 const max_frames_in_flight = 2;
+const supported_window_sizes: []const vk.Extent2D = &[_]vk.Extent2D{
+    .{ .width = 1280, .height = 1024 },
+    .{ .width = 1366, .height = 768 },
+    .{ .width = 1600, .height = 900 },
+    .{ .width = 1920, .height = 1080 },
+    .{ .width = 1920, .height = 1200 },
+    .{ .width = 2560, .height = 1440 },
+    .{ .width = 3440, .height = 1440 },
+    .{ .width = 3840, .height = 2160 },
+};
+
+const UserConfiguredData = struct {
+    vertices_data: []const Vertex,
+    window_start_size: glfw.Window.Size,
+};
+
 pub fn main() !void {
     try file_logger.init("vulkan-spincube.log", .{ .stderr_level = .warn });
     defer file_logger.deinit();
@@ -544,7 +560,7 @@ pub fn main() !void {
     try glfw.init(.{});
     defer glfw.terminate();
 
-    const window = try glfw.Window.create(600, 600, "vulkan-spincube", null, null, glfw.Window.Hints{ .client_api = .no_api });
+    const window = try glfw.Window.create(600, 600, "vulkan-spincube", null, null, glfw.Window.Hints{ .client_api = .no_api, .resizable = false });
     defer window.destroy();
 
     const WindowData = struct {
@@ -555,8 +571,8 @@ pub fn main() !void {
     defer window.setUserPointer(null);
     window.setFocusCallback(struct {
         fn focusCallback(wnd: glfw.Window, focused: bool) void {
-            const user_data = wnd.getUserPointer(WindowData).?;
-            user_data.we_are_in_focus = focused;
+            const p_user_data = wnd.getUserPointer(WindowData).?;
+            p_user_data.we_are_in_focus = focused;
         }
     }.focusCallback);
 
@@ -700,13 +716,6 @@ pub fn main() !void {
     };
     defer inst.dsp.destroySurfaceKHR(inst.handle, window_surface, &vkutil.allocCallbacksFrom(&allocator));
 
-    const surface_capabilities = try inst.dsp.getPhysicalDeviceSurfaceCapabilitiesKHR(physical_device, window_surface);
-
-    const surface_formats = try vkutil.getPhysicalDeviceSurfaceFormatsKHRAlloc(allocator, inst.dsp, physical_device, window_surface);
-    defer allocator.free(surface_formats);
-    const surface_present_modes = try vkutil.getPhysicalDeviceSurfacePresentModesKHRAlloc(allocator, inst.dsp, physical_device, window_surface);
-    defer allocator.free(surface_present_modes);
-
     const core_qfi: CoreQueueFamilyIndices = core_qfi: {
         var indices = std.EnumArray(std.meta.FieldEnum(CoreQueueFamilyIndices), ?u32).initFill(null);
 
@@ -807,13 +816,28 @@ pub fn main() !void {
     };
     defer vkutil.destroyDevice(allocator, device.dsp, device.handle);
 
-    var swapchain: Swapchain = try Swapchain.create(allocator, device, window_surface, surface_formats, surface_present_modes, surface_capabilities, core_qfi, framebuffer_size: {
-        const fb_size = try window.getFramebufferSize();
-        break :framebuffer_size vk.Extent2D{
-            .width = fb_size.width,
-            .height = fb_size.height,
-        };
-    });
+    var surface_formats = std.ArrayList(vk.SurfaceFormatKHR).init(allocator);
+    defer surface_formats.deinit();
+
+    var surface_present_modes = std.ArrayList(vk.PresentModeKHR).init(allocator);
+    defer surface_present_modes.deinit();
+
+    var swapchain: Swapchain = try Swapchain.create(
+        allocator,
+        device,
+        window_surface,
+        try vkutil.getPhysicalDeviceSurfaceFormatsKHRArrayList(&surface_formats, inst.dsp, physical_device, window_surface),
+        try vkutil.getPhysicalDeviceSurfacePresentModesKHRArrayList(&surface_present_modes, inst.dsp, physical_device, window_surface),
+        try inst.dsp.getPhysicalDeviceSurfaceCapabilitiesKHR(physical_device, window_surface),
+        core_qfi,
+        framebuffer_size: {
+            const fb_size = try window.getFramebufferSize();
+            break :framebuffer_size vk.Extent2D{
+                .width = fb_size.width,
+                .height = fb_size.height,
+            };
+        },
+    );
     defer swapchain.destroy(allocator, device);
 
     const graphics_pipeline_layout: vk.PipelineLayout = graphics_pipeline_layout: {
@@ -1309,10 +1333,16 @@ pub fn main() !void {
 
     var current_frame: u32 = 0;
     defer device.dsp.deviceWaitIdle(device.handle) catch |err| std.log.err("deviceWaitIdle: {s}", .{@errorName(err)});
+
+    var timer = try std.time.Timer.start();
     mainloop: while (!window.shouldClose()) {
         try glfw.pollEvents();
-
         if (!window_data.we_are_in_focus) continue;
+
+        if (timer.read() >= 16 * std.time.ns_per_ms) {
+            timer.reset();
+        } else continue :mainloop;
+
         handle_framebuffer_resizes: {
             const fbsize: vk.Extent2D = fbsize: {
                 const fbsize = try window.getFramebufferSize();
@@ -1325,7 +1355,11 @@ pub fn main() !void {
             if (fbsize.width != swapchain.details.extent.width or
                 fbsize.height != swapchain.details.extent.height)
             {
-                try swapchain.recreate(allocator, device, window_surface, surface_formats, surface_present_modes, surface_capabilities, core_qfi, fbsize);
+                const capabilities = try inst.dsp.getPhysicalDeviceSurfaceCapabilitiesKHR(physical_device, window_surface);
+                const formats = try vkutil.getPhysicalDeviceSurfaceFormatsKHRArrayList(&surface_formats, inst.dsp, physical_device, window_surface);
+                const present_modes = try vkutil.getPhysicalDeviceSurfacePresentModesKHRArrayList(&surface_present_modes, inst.dsp, physical_device, window_surface);
+
+                try swapchain.recreate(allocator, device, window_surface, formats, present_modes, capabilities, core_qfi, fbsize);
                 for (swapchain_framebuffers.items) |fb| {
                     device.dsp.destroyFramebuffer(device.handle, fb, &vkutil.allocCallbacksFrom(&allocator));
                 }
@@ -1358,14 +1392,14 @@ pub fn main() !void {
                 image_available,
                 .null_handle,
             )) |ret| switch (ret.result) {
-                .success,
-                .suboptimal_khr,
-                => ret.image_index,
-                .not_ready => continue :mainloop,
-                .timeout => blk: {
+                .success => ret.image_index,
+                .suboptimal_khr => blk: {
                     std.log.warn("acquireNextImageKHR: {s}.", .{@tagName(ret.result)});
                     break :blk ret.image_index;
                 },
+                .timeout,
+                .not_ready,
+                => continue :mainloop,
 
                 else => unreachable,
             } else |err| switch (err) {
@@ -1450,9 +1484,12 @@ pub fn main() !void {
             })) |result| switch (result) {
                 .success => {},
                 else => std.log.info("queuePresentKHR: {s}.", .{@tagName(result)}),
-            } else |err| switch (err) {
-                error.OutOfDateKHR => continue,
-                else => return err,
+            } else |err| {
+                std.log.warn("queuePresentKHR error: {s}.", .{@errorName(err)});
+                switch (err) {
+                    error.OutOfDateKHR => continue :mainloop,
+                    else => return err,
+                }
             }
 
             break :draw_frame;

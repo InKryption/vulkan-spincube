@@ -338,6 +338,30 @@ pub fn getPhysicalDeviceSurfaceFormatsKHRAlloc(
     std.debug.assert(formats.len == count);
     return formats;
 }
+pub fn getPhysicalDeviceSurfaceFormatsKHRArrayList(
+    arraylist: *std.ArrayList(vk.SurfaceFormatKHR),
+    instance_dsp: anytype,
+    physical_device: vk.PhysicalDevice,
+    surface_khr: vk.SurfaceKHR,
+) (std.mem.Allocator.Error || @TypeOf(instance_dsp).GetPhysicalDeviceSurfaceFormatsKHRError)![]vk.SurfaceFormatKHR {
+    comptime std.debug.assert(isInstanceWrapper(@TypeOf(instance_dsp)));
+
+    var count: u32 = undefined;
+    if (instance_dsp.getPhysicalDeviceSurfaceFormatsKHR(physical_device, surface_khr, &count, null)) |result| switch (result) {
+        .success => {},
+        else => unreachable,
+    } else |err| return err;
+
+    try arraylist.resize(count);
+    if (instance_dsp.getPhysicalDeviceSurfaceFormatsKHR(physical_device, surface_khr, &count, arraylist.items.ptr)) |result| switch (result) {
+        .success => {},
+        else => unreachable,
+    } else |err| return err;
+
+    std.debug.assert(arraylist.items.len == count);
+    return arraylist.items;
+}
+
 pub fn getPhysicalDeviceSurfacePresentModesKHRAlloc(
     allocator: std.mem.Allocator,
     instance_dsp: anytype,
@@ -363,6 +387,30 @@ pub fn getPhysicalDeviceSurfacePresentModesKHRAlloc(
     std.debug.assert(present_modes.len == count);
     return present_modes;
 }
+pub fn getPhysicalDeviceSurfacePresentModesKHRArrayList(
+    arraylist: *std.ArrayList(vk.PresentModeKHR),
+    instance_dsp: anytype,
+    physical_device: vk.PhysicalDevice,
+    surface_khr: vk.SurfaceKHR,
+) (std.mem.Allocator.Error || @TypeOf(instance_dsp).GetPhysicalDeviceSurfacePresentModesKHRError)![]vk.PresentModeKHR {
+    comptime std.debug.assert(isInstanceWrapper(@TypeOf(instance_dsp)));
+
+    var count: u32 = undefined;
+    if (instance_dsp.getPhysicalDeviceSurfacePresentModesKHR(physical_device, surface_khr, &count, null)) |result| switch (result) {
+        .success => {},
+        else => unreachable,
+    } else |err| return err;
+
+    try arraylist.resize(count);
+    if (instance_dsp.getPhysicalDeviceSurfacePresentModesKHR(physical_device, surface_khr, &count, arraylist.items.ptr)) |result| switch (result) {
+        .success => {},
+        else => unreachable,
+    } else |err| return err;
+
+    std.debug.assert(arraylist.items.len == count);
+    return arraylist.items;
+}
+
 pub fn enumerateDeviceExtensionPropertiesAlloc(
     allocator: std.mem.Allocator,
     instance_dsp: anytype,
