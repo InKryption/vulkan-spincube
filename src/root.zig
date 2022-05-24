@@ -477,6 +477,70 @@ pub fn main() !void {
 
     const allocator: std.mem.Allocator = gpa.allocator();
 
+    const vertices_data: []const Vertex = vertices_data: {
+        var vertices_data = try std.ArrayList(Vertex).initCapacity(allocator, 64);
+        errdefer vertices_data.deinit();
+
+        var local_arena_state = std.heap.ArenaAllocator.init(allocator);
+        defer local_arena_state.deinit();
+
+        const local_arena = local_arena_state.allocator();
+
+        const data_text: []const u8 = data_text: {
+            const default_data =
+                \\ 0.0, -0.5, 1.0, 0.0, 0.0
+                \\ 0.5,  0.5, 0.0, 1.0, 0.0
+                \\-0.5,  0.5, 0.0, 0.0, 1.0
+            ;
+
+            const data_file_path: []const u8 = data_file_path: {
+                var args_iter = try std.process.argsWithAllocator(local_arena);
+                defer args_iter.deinit();
+
+                std.debug.assert(args_iter.skip()); // assertion failed: no executable name???
+                const path = args_iter.next() orelse break :data_text default_data;
+                break :data_file_path try local_arena.dupe(u8, path);
+            };
+
+            const data_file = std.fs.cwd().openFile(data_file_path, std.fs.File.OpenFlags{}) catch |err| {
+                std.log.warn("Encountered error '{s}' trying to open file '{s}'; loading default data sheet.", .{ @errorName(err), data_file_path });
+                break :data_text default_data;
+            };
+            defer data_file.close();
+
+            break :data_text try data_file.readToEndAlloc(local_arena, std.mem.page_size * 4);
+        };
+
+        var line_iter = std.mem.tokenize(u8, data_text, "\n");
+        while (line_iter.next()) |line| {
+            if (std.mem.trim(u8, line, " \t").len == 0) continue;
+            var item_iter = std.mem.split(u8, line, ",");
+
+            const helper = struct {
+                fn getFloat(it: *std.mem.SplitIterator(u8), comptime component_name: []const u8) !f32 {
+                    const str = it.next() orelse return @field(anyerror, "Missing" ++ component_name);
+                    return std.fmt.parseFloat(f32, std.mem.trim(u8, str, " \t")) catch return @field(anyerror, "FailedToParse" ++ component_name);
+                }
+            };
+
+            try vertices_data.append(Vertex{
+                .pos = Vertex.Pos{
+                    .x = try helper.getFloat(&item_iter, "PositionX"),
+                    .y = try helper.getFloat(&item_iter, "PositionY"),
+                },
+                .color = Vertex.Color{
+                    .r = try helper.getFloat(&item_iter, "RedValue"),
+                    .g = try helper.getFloat(&item_iter, "GreenValue"),
+                    .b = try helper.getFloat(&item_iter, "BlueValue"),
+                },
+            });
+            std.debug.assert(item_iter.next() == null);
+        }
+
+        break :vertices_data vertices_data.toOwnedSlice();
+    };
+    defer allocator.free(vertices_data);
+
     try glfw.init(.{});
     defer glfw.terminate();
 
@@ -1150,12 +1214,6 @@ pub fn main() !void {
         copy.deinit(allocator);
     }
 
-    const vertices = [3]Vertex{
-        .{ .pos = Vertex.Pos{ .x = 0.0, .y = -0.5 }, .color = Vertex.Color{ .r = 1.0, .g = 0.0, .b = 0.0 } },
-        .{ .pos = Vertex.Pos{ .x = 0.5, .y = 0.5 }, .color = Vertex.Color{ .r = 0.0, .g = 1.0, .b = 0.0 } },
-        .{ .pos = Vertex.Pos{ .x = -0.5, .y = 0.5 }, .color = Vertex.Color{ .r = 0.0, .g = 0.0, .b = 1.0 } },
-    };
-
     const vertices_bufmem: BufAndMem = try BufAndMem.create(
         allocator,
         device,
@@ -1164,7 +1222,7 @@ pub fn main() !void {
             .device_local_bit = true,
         },
         vkutil.BufferCreateInfo{
-            .size = vertices.len * @sizeOf(Vertex),
+            .size = vertices_data.len * @sizeOf(Vertex),
             .usage = vk.BufferUsageFlags{
                 .vertex_buffer_bit = true,
                 .transfer_dst_bit = true,
@@ -1188,7 +1246,7 @@ pub fn main() !void {
                 .host_coherent_bit = true,
             },
             vkutil.BufferCreateInfo{
-                .size = vertices.len * @sizeOf(Vertex),
+                .size = vertices_data.len * @sizeOf(Vertex),
                 .usage = vk.BufferUsageFlags{
                     .vertex_buffer_bit = true,
                     .transfer_src_bit = true,
@@ -1204,7 +1262,7 @@ pub fn main() !void {
             const mapped_memory = (try device.dsp.mapMemory(device.handle, staging_bufmem.mem, 0, requirements.size, .{})).?;
             defer device.dsp.unmapMemory(device.handle, staging_bufmem.mem);
 
-            std.mem.copy(u8, @ptrCast([*]u8, mapped_memory)[0 .. @sizeOf(Vertex) * vertices.len], std.mem.sliceAsBytes(std.mem.span(&vertices)));
+            std.mem.copy(u8, @ptrCast([*]u8, mapped_memory)[0 .. @sizeOf(Vertex) * vertices_data.len], std.mem.sliceAsBytes(vertices_data));
             break :init_staging_buffer;
         }
 
@@ -1223,7 +1281,7 @@ pub fn main() !void {
         device.dsp.cmdCopyBuffer(copy_cmdbuffer, staging_bufmem.buf, vertices_bufmem.buf, 1, &[_]vk.BufferCopy{.{
             .src_offset = 0,
             .dst_offset = 0,
-            .size = vertices.len * @sizeOf(Vertex),
+            .size = vertices_data.len * @sizeOf(Vertex),
         }});
         try device.dsp.endCommandBuffer(copy_cmdbuffer);
 
@@ -1239,7 +1297,6 @@ pub fn main() !void {
             .p_signal_semaphores = std.mem.span(&[_]vk.Semaphore{}).ptr,
         }}, .null_handle);
         try device.dsp.queueWaitIdle(device.dsp.getDeviceQueue(device.handle, core_qfi.graphics, 0));
-        
 
         break :init_vertices_buffer;
     }
@@ -1318,7 +1375,6 @@ pub fn main() !void {
             };
 
             try device.dsp.resetFences(device.handle, 1, @ptrCast(*const [1]vk.Fence, &in_flight));
-
             try device.dsp.resetCommandBuffer(cmdbuffer, vk.CommandBufferResetFlags{});
             record_command_buffer: {
                 try device.dsp.beginCommandBuffer(cmdbuffer, &vk.CommandBufferBeginInfo{
@@ -1326,22 +1382,18 @@ pub fn main() !void {
                     .p_inheritance_info = null,
                 });
 
-                device.dsp.cmdSetViewport(cmdbuffer, 0, 1, &[_]vk.Viewport{
-                    .{
-                        .x = 0.0,
-                        .y = 0.0,
-                        .width = @intToFloat(f32, swapchain.details.extent.width),
-                        .height = @intToFloat(f32, swapchain.details.extent.height),
-                        .min_depth = 0.0,
-                        .max_depth = 0.0,
-                    },
-                });
-                device.dsp.cmdSetScissor(cmdbuffer, 0, 1, &[_]vk.Rect2D{
-                    .{
-                        .offset = vk.Offset2D{ .x = 0, .y = 0 },
-                        .extent = swapchain.details.extent,
-                    },
-                });
+                device.dsp.cmdSetViewport(cmdbuffer, 0, 1, &[_]vk.Viewport{.{
+                    .x = 0.0,
+                    .y = 0.0,
+                    .width = @intToFloat(f32, swapchain.details.extent.width),
+                    .height = @intToFloat(f32, swapchain.details.extent.height),
+                    .min_depth = 0.0,
+                    .max_depth = 0.0,
+                }});
+                device.dsp.cmdSetScissor(cmdbuffer, 0, 1, &[_]vk.Rect2D{.{
+                    .offset = vk.Offset2D{ .x = 0, .y = 0 },
+                    .extent = swapchain.details.extent,
+                }});
 
                 device.dsp.cmdBeginRenderPass(cmdbuffer, &vk.RenderPassBeginInfo{
                     .render_pass = graphics_render_pass,
@@ -1364,7 +1416,7 @@ pub fn main() !void {
 
                 device.dsp.cmdBindPipeline(cmdbuffer, .graphics, graphics_pipeline);
                 device.dsp.cmdBindVertexBuffers(cmdbuffer, 0, 1, &[_]vk.Buffer{vertices_bufmem.buf}, &[_]vk.DeviceSize{0});
-                device.dsp.cmdDraw(cmdbuffer, vertices.len, 1, 0, 0);
+                device.dsp.cmdDraw(cmdbuffer, @intCast(u32, vertices_data.len), 1, 0, 0);
 
                 device.dsp.cmdEndRenderPass(cmdbuffer);
 
