@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const glfw = @import("glfw");
 const vk = @import("vulkan");
 const vkutil = @import("vkutil.zig");
+const argsparse = @import("MasterQ32/zig-args");
 
 const build_options = @import("build_options");
 const shader_bytecode_paths = @import("shader-bytecode-paths");
@@ -469,20 +470,83 @@ pub const log_level: std.log.Level = std.enums.nameCast(std.log.Level, build_opt
 
 const max_frames_in_flight = 2;
 const supported_window_sizes: []const vk.Extent2D = &[_]vk.Extent2D{
+    .{ .width = 640, .height = 512 },
     .{ .width = 1280, .height = 1024 },
     .{ .width = 1366, .height = 768 },
     .{ .width = 1600, .height = 900 },
     .{ .width = 1920, .height = 1080 },
     .{ .width = 1920, .height = 1200 },
-    .{ .width = 2560, .height = 1440 },
-    .{ .width = 3440, .height = 1440 },
-    .{ .width = 3840, .height = 2160 },
 };
 
 const UserConfiguredData = struct {
     vertices_data: []const Vertex,
-    window_start_size: glfw.Window.Size,
+    window_start_size_index: usize,
 };
+
+const ParseVertexFromLineError = error{
+    // zig fmt: off
+    MissingPositionX,  FailedToParsePositionX,
+    MissingPositionY,  FailedToParsePositionY,
+    MissingRedValue,   FailedToParseRedValue,
+    MissingGreenValue, FailedToParseGreenValue,
+    MissingBlueValue,  FailedToParseBlueValue,
+    // zig fmt: on
+};
+fn parseVertexFromLine(line: []const u8) ParseVertexFromLineError!Vertex {
+    var item_iter = std.mem.split(u8, std.mem.trim(u8, line, " \t"), ",");
+    defer std.debug.assert(item_iter.next() == null);
+
+    const helper = struct {
+        fn getFloat(it: *std.mem.SplitIterator(u8), comptime component_name: []const u8) !f32 {
+            const str = it.next() orelse return @field(anyerror, "Missing" ++ component_name);
+            return std.fmt.parseFloat(f32, std.mem.trim(u8, str, " \t")) catch return @field(anyerror, "FailedToParse" ++ component_name);
+        }
+    };
+
+    return Vertex{
+        .pos = Vertex.Pos{
+            .x = try helper.getFloat(&item_iter, "PositionX"),
+            .y = try helper.getFloat(&item_iter, "PositionY"),
+        },
+        .color = Vertex.Color{
+            .r = try helper.getFloat(&item_iter, "RedValue"),
+            .g = try helper.getFloat(&item_iter, "GreenValue"),
+            .b = try helper.getFloat(&item_iter, "BlueValue"),
+        },
+    };
+}
+fn parseVerticesCount(data: []const u8) usize {
+    var newlines: usize = 0;
+
+    var line_iter = std.mem.tokenize(u8, data, "\n");
+    while (line_iter.next()) |line| {
+        const line_trimmed = std.mem.trim(u8, line, " \t");
+        newlines += @boolToInt(line_trimmed.len != 0);
+    }
+
+    return newlines;
+}
+fn parseVertices(out: []Vertex, data: []const u8) ParseVertexFromLineError![]Vertex {
+    std.debug.assert(out.len >= parseVerticesCount(data));
+
+    var line_iter = std.mem.tokenize(u8, data, "\n");
+    {
+        defer line_iter.reset();
+        var newlines: usize = 0;
+        while (line_iter.next()) |_| {
+            newlines += 1;
+        }
+    }
+
+    var i: usize = 0;
+    while (line_iter.next()) |line| {
+        if (std.mem.trim(u8, line, " \t").len == 0) continue;
+        out[i] = try parseVertexFromLine(line);
+        i += 1;
+    }
+
+    return out[0..i];
+}
 
 pub fn main() !void {
     try file_logger.init("vulkan-spincube.log", .{ .stderr_level = .warn });
@@ -493,74 +557,91 @@ pub fn main() !void {
 
     const allocator: std.mem.Allocator = gpa.allocator();
 
-    const vertices_data: []const Vertex = vertices_data: {
-        var vertices_data = try std.ArrayList(Vertex).initCapacity(allocator, 64);
-        errdefer vertices_data.deinit();
-
-        var local_arena_state = std.heap.ArenaAllocator.init(allocator);
-        defer local_arena_state.deinit();
-
-        const local_arena = local_arena_state.allocator();
-
-        const data_text: []const u8 = data_text: {
-            const default_data =
-                \\ 0.0, -0.5, 1.0, 0.0, 0.0
-                \\ 0.5,  0.5, 0.0, 1.0, 0.0
-                \\-0.5,  0.5, 0.0, 0.0, 1.0
-            ;
-
-            const data_file_path: []const u8 = data_file_path: {
-                var args_iter = try std.process.argsWithAllocator(local_arena);
-                defer args_iter.deinit();
-
-                std.debug.assert(args_iter.skip()); // assertion failed: no executable name???
-                const path = args_iter.next() orelse break :data_text default_data;
-                break :data_file_path try local_arena.dupe(u8, path);
-            };
-
-            const data_file = std.fs.cwd().openFile(data_file_path, std.fs.File.OpenFlags{}) catch |err| {
-                std.log.warn("Encountered error '{s}' trying to open file '{s}'; loading default data sheet.", .{ @errorName(err), data_file_path });
-                break :data_text default_data;
-            };
-            defer data_file.close();
-
-            break :data_text try data_file.readToEndAlloc(local_arena, std.mem.page_size * 4);
-        };
-
-        var line_iter = std.mem.tokenize(u8, data_text, "\n");
-        while (line_iter.next()) |line| {
-            if (std.mem.trim(u8, line, " \t").len == 0) continue;
-            var item_iter = std.mem.split(u8, line, ",");
-
-            const helper = struct {
-                fn getFloat(it: *std.mem.SplitIterator(u8), comptime component_name: []const u8) !f32 {
-                    const str = it.next() orelse return @field(anyerror, "Missing" ++ component_name);
-                    return std.fmt.parseFloat(f32, std.mem.trim(u8, str, " \t")) catch return @field(anyerror, "FailedToParse" ++ component_name);
-                }
-            };
-
-            try vertices_data.append(Vertex{
-                .pos = Vertex.Pos{
-                    .x = try helper.getFloat(&item_iter, "PositionX"),
-                    .y = try helper.getFloat(&item_iter, "PositionY"),
-                },
-                .color = Vertex.Color{
-                    .r = try helper.getFloat(&item_iter, "RedValue"),
-                    .g = try helper.getFloat(&item_iter, "GreenValue"),
-                    .b = try helper.getFloat(&item_iter, "BlueValue"),
-                },
-            });
-            std.debug.assert(item_iter.next() == null);
-        }
-
-        break :vertices_data vertices_data.toOwnedSlice();
-    };
-    defer allocator.free(vertices_data);
-
     try glfw.init(.{});
     defer glfw.terminate();
 
-    const window = try glfw.Window.create(600, 600, "vulkan-spincube", null, null, glfw.Window.Hints{ .client_api = .no_api, .resizable = false });
+    const user_configured_data: UserConfiguredData = user_configured_data: {
+        const CmdLineSpec = struct {
+            vertices: ?[]const u8 = null,
+            size: ?usize = null,
+        };
+        const cmdline_parse_result = try argsparse.parseForCurrentProcess(CmdLineSpec, allocator, .silent);
+        defer cmdline_parse_result.deinit();
+
+        const cmdline_options: CmdLineSpec = cmdline_parse_result.options;
+
+        const window_start_size_index: usize = window_start_size_index: {
+            if (cmdline_options.size) |size| {
+                break :window_start_size_index size;
+            }
+            const primary_monitor = glfw.Monitor.getPrimary() orelse return error.CouldNotGetPrimaryMonitorSize;
+            const work_area = try primary_monitor.getWorkarea();
+            var i = supported_window_sizes.len;
+            while (true) {
+                if (i == 0) break;
+                i -= 1;
+                const supported_size = supported_window_sizes[i];
+                if (supported_size.width <= work_area.width and
+                    supported_size.height <= work_area.height)
+                {
+                    break :window_start_size_index i;
+                }
+            }
+            return error.UnsupportedScreenSize;
+        };
+
+        const vertices_data: []const Vertex = vertices_data: {
+            var vertices_data = try std.ArrayList(Vertex).initCapacity(allocator, 64);
+            errdefer vertices_data.deinit();
+
+            var local_arena_state = std.heap.ArenaAllocator.init(allocator);
+            defer local_arena_state.deinit();
+
+            const local_arena = local_arena_state.allocator();
+            const data_text: []const u8 = data_text: {
+                const default_data =
+                    \\ 0.0, -0.5, 1.0, 0.0, 0.0
+                    \\ 0.5,  0.5, 0.0, 1.0, 0.0
+                    \\-0.5,  0.5, 0.0, 0.0, 1.0
+                ;
+
+                const data_file_path: []const u8 = cmdline_options.vertices orelse {
+                    break :data_text default_data;
+                };
+
+                const data_file = std.fs.cwd().openFile(data_file_path, std.fs.File.OpenFlags{}) catch |err| {
+                    std.log.warn("Encountered error '{s}' trying to open file '{s}'; loading default data sheet.", .{ @errorName(err), data_file_path });
+                    break :data_text default_data;
+                };
+                defer data_file.close();
+
+                break :data_text try data_file.readToEndAlloc(local_arena, std.mem.page_size * 4);
+            };
+
+            try vertices_data.resize(parseVerticesCount(data_text));
+            vertices_data.shrinkRetainingCapacity((try parseVertices(vertices_data.items, data_text)).len);
+
+            break :vertices_data vertices_data.toOwnedSlice();
+        };
+        errdefer allocator.free(vertices_data);
+
+        break :user_configured_data UserConfiguredData{
+            .vertices_data = vertices_data,
+            .window_start_size_index = window_start_size_index,
+        };
+    };
+
+    const vertices_data = user_configured_data.vertices_data;
+    defer allocator.free(vertices_data);
+
+    const window = try glfw.Window.create(
+        supported_window_sizes[user_configured_data.window_start_size_index].width,
+        supported_window_sizes[user_configured_data.window_start_size_index].height,
+        "vulkan-spincube",
+        null,
+        null,
+        glfw.Window.Hints{ .client_api = .no_api, .resizable = false },
+    );
     defer window.destroy();
 
     const WindowData = struct {

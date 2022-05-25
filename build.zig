@@ -27,6 +27,13 @@ pub fn build(b: *std.build.Builder) void {
     mach.glfw.link(b, exe, mach.glfw.Options{ .vulkan = true });
     exe.addPackage(mach.glfw.pkg);
 
+    const @"zig-args" = std.build.Pkg{
+        .name = "MasterQ32/zig-args",
+        .path = .{ .path = "dep/MasterQ32/zig-args/args.zig" },
+    };
+
+    exe.addPackage(@"zig-args");
+
     const vk_shader_compile_step = vk.ShaderCompileStep.init(b, &.{"glslc"}, "shader-bytecode");
     exe.step.dependOn(&vk_shader_compile_step.step);
     {

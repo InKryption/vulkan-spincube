@@ -7,3 +7,6 @@
 [submodule "dep/KhronosGroup/Vulkan-Docs"]
 	path = dep/KhronosGroup/Vulkan-Docs
 	url = https://github.com/KhronosGroup/Vulkan-Docs.git
+[submodule "dep/MasterQ32/zig-args"]
+	path = dep/MasterQ32/zig-args
+	url = https://github.com/MasterQ32/zig-args.git
