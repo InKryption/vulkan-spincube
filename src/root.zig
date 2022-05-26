@@ -273,55 +273,6 @@ const Swapchain = struct {
         slice.* = swapchain_images.toOwnedSlice();
     }
 };
-const BufAndMem = struct {
-    buf: vk.Buffer,
-    mem: vk.DeviceMemory,
-
-    const DeviceErrors = DeviceDispatch.CreateBufferError || DeviceDispatch.AllocateMemoryError || DeviceDispatch.BindBufferMemoryError;
-    const CreateError = DeviceErrors || error{
-        NoSuitableMemoryTypesOnSelectedPhysicalDevice,
-    };
-
-    fn create(
-        allocator: std.mem.Allocator,
-        device: VulkanDevice,
-        physical_device_properties: vk.PhysicalDeviceMemoryProperties,
-        min_required_flags: vk.MemoryPropertyFlags,
-        buf_create_info: vkutil.BufferCreateInfo,
-    ) BufAndMem.CreateError!BufAndMem {
-        const buf: vk.Buffer = try vkutil.createBuffer(allocator, device.dsp, device.handle, buf_create_info);
-        errdefer vkutil.destroyBuffer(allocator, device.dsp, device.handle, buf);
-
-        const mem: vk.DeviceMemory = mem: {
-            const requirements = device.dsp.getBufferMemoryRequirements(device.handle, buf);
-            const memtype_index: u32 = memtype_index: {
-                const memtypes: []const vk.MemoryType = physical_device_properties.memory_types[0..physical_device_properties.memory_type_count];
-                for (memtypes) |memtype, memtype_index| {
-                    if (requirements.memory_type_bits & std.math.shl(u32, 1, memtype_index) == 0) continue;
-                    if (!memtype.property_flags.contains(min_required_flags)) continue;
-                    break :memtype_index @intCast(u32, memtype_index);
-                }
-                return error.NoSuitableMemoryTypesOnSelectedPhysicalDevice;
-            };
-            break :mem try vkutil.allocateMemory(allocator, device.dsp, device.handle, vk.MemoryAllocateInfo{
-                .allocation_size = requirements.size,
-                .memory_type_index = memtype_index,
-            });
-        };
-        errdefer vkutil.freeMemory(allocator, device.dsp, device.handle, mem);
-
-        try device.dsp.bindBufferMemory(device.handle, buf, mem, 0);
-        return BufAndMem{
-            .buf = buf,
-            .mem = mem,
-        };
-    }
-
-    fn destroy(self: BufAndMem, allocator: std.mem.Allocator, device: VulkanDevice) void {
-        vkutil.freeMemory(allocator, device.dsp, device.handle, self.mem);
-        vkutil.destroyBuffer(allocator, device.dsp, device.handle, self.buf);
-    }
-};
 
 const Vertex = extern struct {
     pos: Pos,
@@ -442,7 +393,9 @@ const DeviceDispatch = vk.DeviceWrapper(vk.DeviceCommandFlags{
     .cmdEndRenderPass = true,
     .cmdBindPipeline = true,
     .cmdBindVertexBuffers = true,
-    .cmdDraw = true,
+    .cmdBindIndexBuffer = true,
+    // .cmdDraw = true,
+    .cmdDrawIndexed = true,
 
     .acquireNextImageKHR = true,
 
@@ -470,10 +423,10 @@ pub const log_level: std.log.Level = std.enums.nameCast(std.log.Level, build_opt
 
 const max_frames_in_flight = 2;
 const supported_window_sizes: []const vk.Extent2D = &[_]vk.Extent2D{
-    .{ .width = 640, .height = 512 },
-    .{ .width = 1280, .height = 1024 },
-    .{ .width = 1366, .height = 768 },
-    .{ .width = 1600, .height = 900 },
+    .{ .width = 480, .height = 270 },
+    .{ .width = 960, .height = 540 },
+    .{ .width = 960, .height = 600 },
+    .{ .width = 1600, .height = 800 },
     .{ .width = 1920, .height = 1080 },
     .{ .width = 1920, .height = 1200 },
 };
@@ -483,7 +436,7 @@ const UserConfiguredData = struct {
     window_start_size_index: usize,
 };
 
-const ParseVertexFromLineError = error{
+fn parseVertexFromLine(line: []const u8) error{
     // zig fmt: off
     MissingPositionX,  FailedToParsePositionX,
     MissingPositionY,  FailedToParsePositionY,
@@ -491,9 +444,8 @@ const ParseVertexFromLineError = error{
     MissingGreenValue, FailedToParseGreenValue,
     MissingBlueValue,  FailedToParseBlueValue,
     // zig fmt: on
-};
-fn parseVertexFromLine(line: []const u8) ParseVertexFromLineError!Vertex {
-    var item_iter = std.mem.split(u8, std.mem.trim(u8, line, " \t"), ",");
+}!Vertex {
+    var item_iter = std.mem.split(u8, line, ",");
     defer std.debug.assert(item_iter.next() == null);
 
     const helper = struct {
@@ -515,37 +467,30 @@ fn parseVertexFromLine(line: []const u8) ParseVertexFromLineError!Vertex {
         },
     };
 }
-fn parseVerticesCount(data: []const u8) usize {
-    var newlines: usize = 0;
 
-    var line_iter = std.mem.tokenize(u8, data, "\n");
-    while (line_iter.next()) |line| {
-        const line_trimmed = std.mem.trim(u8, line, " \t");
-        newlines += @boolToInt(line_trimmed.len != 0);
-    }
-
-    return newlines;
+/// Returns an instance of `vk.MemoryRequirements` which would
+/// require a memory type and allocation size to accomodate both.
+fn combinedMemoryRequirements(a: vk.MemoryRequirements, b: vk.MemoryRequirements) vk.MemoryRequirements {
+    const alignment = @maximum(a.alignment, b.alignment);
+    return vk.MemoryRequirements{
+        .size = std.mem.alignAllocLen(a.size + b.size, a.size + b.size, @intCast(u29, alignment)),
+        .alignment = alignment,
+        .memory_type_bits = a.memory_type_bits | b.memory_type_bits,
+    };
 }
-fn parseVertices(out: []Vertex, data: []const u8) ParseVertexFromLineError![]Vertex {
-    std.debug.assert(out.len >= parseVerticesCount(data));
 
-    var line_iter = std.mem.tokenize(u8, data, "\n");
-    {
-        defer line_iter.reset();
-        var newlines: usize = 0;
-        while (line_iter.next()) |_| {
-            newlines += 1;
-        }
+fn selectMemoryTypeIndex(
+    mem_properties: vk.PhysicalDeviceMemoryProperties,
+    property_flags: vk.MemoryPropertyFlags,
+    mem_requirements: vk.MemoryRequirements,
+) ?u32 {
+    const memtypes: []const vk.MemoryType = mem_properties.memory_types[0..mem_properties.memory_type_count];
+    for (memtypes) |memtype, memtype_index| {
+        if (std.math.shl(u32, 1, memtype_index) & mem_requirements.memory_type_bits == 0) continue;
+        if (!memtype.property_flags.contains(property_flags)) continue;
+        return @intCast(u32, memtype_index);
     }
-
-    var i: usize = 0;
-    while (line_iter.next()) |line| {
-        if (std.mem.trim(u8, line, " \t").len == 0) continue;
-        out[i] = try parseVertexFromLine(line);
-        i += 1;
-    }
-
-    return out[0..i];
+    return null;
 }
 
 pub fn main() !void {
@@ -565,10 +510,49 @@ pub fn main() !void {
             vertices: ?[]const u8 = null,
             size: ?usize = null,
         };
-        const cmdline_parse_result = try argsparse.parseForCurrentProcess(CmdLineSpec, allocator, .silent);
-        defer cmdline_parse_result.deinit();
 
+        var local_arena_state = std.heap.ArenaAllocator.init(allocator);
+        defer local_arena_state.deinit();
+
+        const local_arena = local_arena_state.allocator();
+
+        const cmdline_parse_result = try argsparse.parseForCurrentProcess(CmdLineSpec, local_arena, .silent);
         const cmdline_options: CmdLineSpec = cmdline_parse_result.options;
+
+        const vertices_data: []const Vertex = vertices_data: {
+            var vertices_data = try std.ArrayList(Vertex).initCapacity(allocator, 64);
+            errdefer vertices_data.deinit();
+
+            const data_text: []const u8 = data_text: {
+                const default_data =
+                    \\ 0.0, -0.5, 1.0, 0.0, 0.0
+                    \\ 0.5,  0.5, 0.0, 1.0, 0.0
+                    \\-0.5,  0.5, 0.0, 0.0, 1.0
+                ;
+
+                const data_file_path: []const u8 = cmdline_options.vertices orelse {
+                    break :data_text default_data;
+                };
+
+                const data_file = std.fs.cwd().openFile(data_file_path, std.fs.File.OpenFlags{}) catch |err| {
+                    std.log.warn("Encountered error '{s}' trying to open file '{s}'; loading default data sheet.", .{ @errorName(err), data_file_path });
+                    break :data_text default_data;
+                };
+                defer data_file.close();
+
+                break :data_text try data_file.readToEndAlloc(local_arena, std.mem.page_size * 4);
+            };
+
+            var line_iter = std.mem.tokenize(u8, data_text, "\n");
+            while (line_iter.next()) |line| {
+                const line_trimmed = std.mem.trim(u8, line, " \t");
+                if (line_trimmed.len == 0) continue;
+                try vertices_data.append(try parseVertexFromLine(line_trimmed));
+            }
+
+            break :vertices_data vertices_data.toOwnedSlice();
+        };
+        errdefer allocator.free(vertices_data);
 
         const window_start_size_index: usize = window_start_size_index: {
             if (cmdline_options.size) |size| {
@@ -590,58 +574,33 @@ pub fn main() !void {
             return error.UnsupportedScreenSize;
         };
 
-        const vertices_data: []const Vertex = vertices_data: {
-            var vertices_data = try std.ArrayList(Vertex).initCapacity(allocator, 64);
-            errdefer vertices_data.deinit();
-
-            var local_arena_state = std.heap.ArenaAllocator.init(allocator);
-            defer local_arena_state.deinit();
-
-            const local_arena = local_arena_state.allocator();
-            const data_text: []const u8 = data_text: {
-                const default_data =
-                    \\ 0.0, -0.5, 1.0, 0.0, 0.0
-                    \\ 0.5,  0.5, 0.0, 1.0, 0.0
-                    \\-0.5,  0.5, 0.0, 0.0, 1.0
-                ;
-
-                const data_file_path: []const u8 = cmdline_options.vertices orelse {
-                    break :data_text default_data;
-                };
-
-                const data_file = std.fs.cwd().openFile(data_file_path, std.fs.File.OpenFlags{}) catch |err| {
-                    std.log.warn("Encountered error '{s}' trying to open file '{s}'; loading default data sheet.", .{ @errorName(err), data_file_path });
-                    break :data_text default_data;
-                };
-                defer data_file.close();
-
-                break :data_text try data_file.readToEndAlloc(local_arena, std.mem.page_size * 4);
-            };
-
-            try vertices_data.resize(parseVerticesCount(data_text));
-            vertices_data.shrinkRetainingCapacity((try parseVertices(vertices_data.items, data_text)).len);
-
-            break :vertices_data vertices_data.toOwnedSlice();
-        };
-        errdefer allocator.free(vertices_data);
-
         break :user_configured_data UserConfiguredData{
             .vertices_data = vertices_data,
             .window_start_size_index = window_start_size_index,
         };
     };
+    defer {
+        allocator.free(user_configured_data.vertices_data);
+    }
 
-    const vertices_data = user_configured_data.vertices_data;
-    defer allocator.free(vertices_data);
+    const indices_data: []const u16 = &[_]u16{
+        0, 1, 2,
+        2, 3, 0,
+    };
+    const vertices_data: []const Vertex = &[_]Vertex{
+        .{ .pos = .{ .x = -0.5, .y = -0.5 }, .color = .{ .r = 1.0, .g = 0.0, .b = 0.0 } },
+        .{ .pos = .{ .x = 00.5, .y = -0.5 }, .color = .{ .r = 0.0, .g = 1.0, .b = 0.0 } },
+        .{ .pos = .{ .x = 00.5, .y = 00.5 }, .color = .{ .r = 0.0, .g = 0.0, .b = 1.0 } },
+        .{ .pos = .{ .x = -0.5, .y = 00.5 }, .color = .{ .r = 1.0, .g = 1.0, .b = 1.0 } },
+    };
 
-    const window = try glfw.Window.create(
-        supported_window_sizes[user_configured_data.window_start_size_index].width,
-        supported_window_sizes[user_configured_data.window_start_size_index].height,
-        "vulkan-spincube",
-        null,
-        null,
-        glfw.Window.Hints{ .client_api = .no_api, .resizable = false },
-    );
+    const window: glfw.Window = window: {
+        const size = supported_window_sizes[user_configured_data.window_start_size_index];
+        break :window try glfw.Window.create(size.width, size.height, "vulkan-spincube", null, null, glfw.Window.Hints{
+            .client_api = .no_api,
+            .resizable = false,
+        });
+    };
     defer window.destroy();
 
     const WindowData = struct {
@@ -782,6 +741,7 @@ pub fn main() !void {
 
         break :physical_device physical_device;
     };
+    const physdev_mem_properties = inst.dsp.getPhysicalDeviceMemoryProperties(physical_device);
 
     const window_surface: vk.SurfaceKHR = window_surface: {
         var window_surface: vk.SurfaceKHR = .null_handle;
@@ -1320,55 +1280,101 @@ pub fn main() !void {
         copy.deinit(allocator);
     }
 
-    const vertices_bufmem: BufAndMem = try BufAndMem.create(
-        allocator,
-        device,
-        inst.dsp.getPhysicalDeviceMemoryProperties(physical_device),
-        vk.MemoryPropertyFlags{
-            .device_local_bit = true,
+    const vertices_buffer_len: usize = vertices_data.len * @sizeOf(Vertex);
+    const vertices_buffer: vk.Buffer = try vkutil.createBuffer(allocator, device.dsp, device.handle, vkutil.BufferCreateInfo{
+        .size = vertices_buffer_len,
+        .usage = vk.BufferUsageFlags{
+            .vertex_buffer_bit = true,
+            .transfer_dst_bit = true,
         },
-        vkutil.BufferCreateInfo{
-            .size = vertices_data.len * @sizeOf(Vertex),
+        .sharing_mode = .exclusive,
+        .queue_family_indices = &.{},
+    });
+    defer vkutil.destroyBuffer(allocator, device.dsp, device.handle, vertices_buffer);
+
+    const indices_buffer_len: usize = indices_data.len * @sizeOf(u16);
+    const index_buffer: vk.Buffer = try vkutil.createBuffer(allocator, device.dsp, device.handle, vkutil.BufferCreateInfo{
+        .size = indices_buffer_len,
+        .usage = vk.BufferUsageFlags{
+            .index_buffer_bit = true,
+            .transfer_dst_bit = true,
+        },
+        .sharing_mode = .exclusive,
+        .queue_family_indices = &.{},
+    });
+    defer vkutil.destroyBuffer(allocator, device.dsp, device.handle, index_buffer);
+
+    const vert_buff_mem_req = device.dsp.getBufferMemoryRequirements(device.handle, vertices_buffer);
+    const indices_buff_mem_req = device.dsp.getBufferMemoryRequirements(device.handle, index_buffer);
+
+    const vertices_and_indices_mem: vk.DeviceMemory = vertices_and_indices_mem: {
+        const combined_requirements = combinedMemoryRequirements(
+            vert_buff_mem_req,
+            indices_buff_mem_req,
+        );
+
+        const memtype_index: u32 = selectMemoryTypeIndex(
+            physdev_mem_properties,
+            .{ .device_local_bit = true },
+            combined_requirements,
+        ) orelse return error.NoSuitableMemoryTypesOnSelectedPhysicalDevice;
+
+        break :vertices_and_indices_mem try vkutil.allocateMemory(allocator, device.dsp, device.handle, vk.MemoryAllocateInfo{
+            .allocation_size = combined_requirements.size,
+            .memory_type_index = memtype_index,
+        });
+    };
+    defer vkutil.freeMemory(allocator, device.dsp, device.handle, vertices_and_indices_mem);
+
+    try device.dsp.bindBufferMemory(device.handle, vertices_buffer, vertices_and_indices_mem, 0);
+    try device.dsp.bindBufferMemory(device.handle, index_buffer, vertices_and_indices_mem, vertices_buffer_len);
+
+    init_vertices_and_indices_buffers: {
+        const staging_buffer: vk.Buffer = try vkutil.createBuffer(allocator, device.dsp, device.handle, vkutil.BufferCreateInfo{
+            .size = combinedMemoryRequirements(vert_buff_mem_req, indices_buff_mem_req).size,
             .usage = vk.BufferUsageFlags{
                 .vertex_buffer_bit = true,
-                .transfer_dst_bit = true,
+                .index_buffer_bit = true,
+                .transfer_src_bit = true,
             },
-
             .sharing_mode = .exclusive,
             .queue_family_indices = &.{},
-        },
-    );
-    defer vertices_bufmem.destroy(allocator, device);
+        });
+        defer vkutil.destroyBuffer(allocator, device.dsp, device.handle, staging_buffer);
 
-    init_vertices_buffer: {
-        const requirements = device.dsp.getBufferMemoryRequirements(device.handle, vertices_bufmem.buf);
+        const staging_buff_mem_req = device.dsp.getBufferMemoryRequirements(device.handle, staging_buffer);
+        std.debug.assert(std.meta.eql(staging_buff_mem_req, combinedMemoryRequirements(vert_buff_mem_req, indices_buff_mem_req)));
 
-        const staging_bufmem: BufAndMem = try BufAndMem.create(
-            allocator,
-            device,
-            inst.dsp.getPhysicalDeviceMemoryProperties(physical_device),
-            vk.MemoryPropertyFlags{
-                .host_visible_bit = true,
-                .host_coherent_bit = true,
-            },
-            vkutil.BufferCreateInfo{
-                .size = vertices_data.len * @sizeOf(Vertex),
-                .usage = vk.BufferUsageFlags{
-                    .vertex_buffer_bit = true,
-                    .transfer_src_bit = true,
+        const staging_buff_mem: vk.DeviceMemory = try vkutil.allocateMemory(allocator, device.dsp, device.handle, vk.MemoryAllocateInfo{
+            .allocation_size = staging_buff_mem_req.size,
+            .memory_type_index = selectMemoryTypeIndex(
+                physdev_mem_properties,
+                vk.MemoryPropertyFlags{
+                    .host_visible_bit = true,
+                    .host_coherent_bit = true,
                 },
+                staging_buff_mem_req,
+            ) orelse return error.NoSuitableMemoryTypesOnSelectedPhysicalDeviceForStagingBuffer,
+        });
+        defer vkutil.freeMemory(allocator, device.dsp, device.handle, staging_buff_mem);
 
-                .sharing_mode = .exclusive,
-                .queue_family_indices = &.{},
-            },
-        );
-        defer staging_bufmem.destroy(allocator, device);
+        try device.dsp.bindBufferMemory(device.handle, staging_buffer, staging_buff_mem, 0);
 
         init_staging_buffer: {
-            const mapped_memory = (try device.dsp.mapMemory(device.handle, staging_bufmem.mem, 0, requirements.size, .{})).?;
-            defer device.dsp.unmapMemory(device.handle, staging_bufmem.mem);
+            const mapped_memory = (try device.dsp.mapMemory(device.handle, staging_buff_mem, 0, staging_buff_mem_req.size, .{})).?;
+            defer device.dsp.unmapMemory(device.handle, staging_buff_mem);
 
-            std.mem.copy(u8, @ptrCast([*]u8, mapped_memory)[0 .. @sizeOf(Vertex) * vertices_data.len], std.mem.sliceAsBytes(vertices_data));
+            @memcpy(
+                @ptrCast([*]u8, mapped_memory),
+                @ptrCast([*]const u8, vertices_data),
+                vertices_buffer_len,
+            );
+            @memcpy(
+                @ptrCast([*]u8, mapped_memory) + vertices_buffer_len,
+                @ptrCast([*]const u8, indices_data),
+                indices_buffer_len,
+            );
+
             break :init_staging_buffer;
         }
 
@@ -1380,16 +1386,26 @@ pub fn main() !void {
         }, @ptrCast(*[1]vk.CommandBuffer, &copy_cmdbuffer));
         defer device.dsp.freeCommandBuffers(device.handle, copying_cmdpool, 1, @ptrCast(*const [1]vk.CommandBuffer, &copy_cmdbuffer));
 
-        try device.dsp.beginCommandBuffer(copy_cmdbuffer, &vk.CommandBufferBeginInfo{
-            .flags = vk.CommandBufferUsageFlags{ .one_time_submit_bit = true },
-            .p_inheritance_info = null,
-        });
-        device.dsp.cmdCopyBuffer(copy_cmdbuffer, staging_bufmem.buf, vertices_bufmem.buf, 1, &[_]vk.BufferCopy{.{
-            .src_offset = 0,
-            .dst_offset = 0,
-            .size = vertices_data.len * @sizeOf(Vertex),
-        }});
-        try device.dsp.endCommandBuffer(copy_cmdbuffer);
+        record_copy_cmdbuffer: {
+            try device.dsp.beginCommandBuffer(copy_cmdbuffer, &vk.CommandBufferBeginInfo{
+                .flags = vk.CommandBufferUsageFlags{ .one_time_submit_bit = true },
+                .p_inheritance_info = null,
+            });
+
+            device.dsp.cmdCopyBuffer(copy_cmdbuffer, staging_buffer, vertices_buffer, 1, &[_]vk.BufferCopy{.{
+                .src_offset = 0,
+                .dst_offset = 0,
+                .size = vertices_buffer_len,
+            }});
+            device.dsp.cmdCopyBuffer(copy_cmdbuffer, staging_buffer, index_buffer, 1, &[_]vk.BufferCopy{.{
+                .src_offset = vert_buff_mem_req.size,
+                .dst_offset = 0,
+                .size = indices_buffer_len,
+            }});
+
+            try device.dsp.endCommandBuffer(copy_cmdbuffer);
+            break :record_copy_cmdbuffer;
+        }
 
         try device.dsp.queueSubmit(device.dsp.getDeviceQueue(device.handle, core_qfi.graphics, 0), 1, &[_]vk.SubmitInfo{.{
             .wait_semaphore_count = @intCast(u32, 0),
@@ -1404,7 +1420,7 @@ pub fn main() !void {
         }}, .null_handle);
         try device.dsp.queueWaitIdle(device.dsp.getDeviceQueue(device.handle, core_qfi.graphics, 0));
 
-        break :init_vertices_buffer;
+        break :init_vertices_and_indices_buffers;
     }
 
     const in_flight_slice: []const vk.Fence = syncronized_frames.items(.in_flight);
@@ -1529,8 +1545,9 @@ pub fn main() !void {
                 }, .@"inline");
 
                 device.dsp.cmdBindPipeline(cmdbuffer, .graphics, graphics_pipeline);
-                device.dsp.cmdBindVertexBuffers(cmdbuffer, 0, 1, &[_]vk.Buffer{vertices_bufmem.buf}, &[_]vk.DeviceSize{0});
-                device.dsp.cmdDraw(cmdbuffer, @intCast(u32, vertices_data.len), 1, 0, 0);
+                device.dsp.cmdBindVertexBuffers(cmdbuffer, 0, 1, &[_]vk.Buffer{vertices_buffer}, &[_]vk.DeviceSize{0});
+                device.dsp.cmdBindIndexBuffer(cmdbuffer, index_buffer, 0, vk.IndexType.uint16);
+                device.dsp.cmdDrawIndexed(cmdbuffer, @intCast(u32, indices_data.len), 1, 0, 0, 0);
 
                 device.dsp.cmdEndRenderPass(cmdbuffer);
 
