@@ -473,24 +473,42 @@ fn parseVertexFromLine(line: []const u8) error{
 fn combinedMemoryRequirements(a: vk.MemoryRequirements, b: vk.MemoryRequirements) vk.MemoryRequirements {
     const alignment = @maximum(a.alignment, b.alignment);
     return vk.MemoryRequirements{
-        .size = std.mem.alignAllocLen(a.size + b.size, a.size + b.size, @intCast(u29, alignment)),
+        .size = std.mem.alignBackwardAnyAlign(a.size + b.size, alignment),
         .alignment = alignment,
-        .memory_type_bits = a.memory_type_bits | b.memory_type_bits,
+        .memory_type_bits = a.memory_type_bits & b.memory_type_bits,
     };
 }
 
-fn selectMemoryTypeIndex(
-    mem_properties: vk.PhysicalDeviceMemoryProperties,
-    property_flags: vk.MemoryPropertyFlags,
+fn selectMemoryType(
+    mem_properties: vkutil.PhysicalDeviceMemoryProperties,
+    /// The memory types from which to choose.
+    /// The allocation description for which the selected index must be eligible for.
     mem_requirements: vk.MemoryRequirements,
+    /// Property flags which the selected index must have enabled.
+    property_flags: vk.MemoryPropertyFlags,
 ) ?u32 {
-    const memtypes: []const vk.MemoryType = mem_properties.memory_types[0..mem_properties.memory_type_count];
-    for (memtypes) |memtype, memtype_index| {
-        if (std.math.shl(u32, 1, memtype_index) & mem_requirements.memory_type_bits == 0) continue;
+    var good_enough: ?u32 = null;
+    for (mem_properties.memory_types.constSlice()) |memtype, memtype_index| {
+        const memtype_bit_mask = std.math.shl(u32, 1, memtype_index);
+        const memtype_allowed = memtype_bit_mask & mem_requirements.memory_type_bits != 0;
+
+        if (!memtype_allowed) continue;
         if (!memtype.property_flags.contains(property_flags)) continue;
+
+        const heap: vk.MemoryHeap = mem_properties.memory_heaps.get(memtype.heap_index);
+        if (mem_requirements.size < heap.size) {
+            if (good_enough) |*currently_good_enough| {
+                const currently_good_enough_type = mem_properties.memory_types.get(currently_good_enough.*);
+                const currently_good_enough_heap = mem_properties.memory_heaps.get(currently_good_enough_type.heap_index);
+                if (currently_good_enough_heap.size < heap.size) continue;
+            }
+            good_enough = @intCast(u32, memtype_index);
+            continue;
+        }
+
         return @intCast(u32, memtype_index);
     }
-    return null;
+    return good_enough;
 }
 
 pub fn main() !void {
@@ -507,9 +525,33 @@ pub fn main() !void {
 
     const user_configured_data: UserConfiguredData = user_configured_data: {
         const CmdLineSpec = struct {
+            /// whether to display the help text
+            help: bool = false,
+            /// path to vertices data file
             vertices: ?[]const u8 = null,
+            /// window size
             size: ?usize = null,
         };
+        const CmdLineDescription = std.EnumArray(std.meta.FieldEnum(CmdLineSpec), []const u8);
+        const cmdline_description: CmdLineDescription = CmdLineDescription.init(.{
+            .help = "    --help: Displays this message.\n",
+            .vertices = "    --vertices: TODO\n",
+            .size = comptime blk: {
+                var str: []const u8 = std.fmt.comptimePrint(
+                    \\    --size: Sets the window size, accepting an index from 0 to {d}, with a mapping:
+                    \\
+                ,
+                    .{supported_window_sizes.len - 1},
+                );
+                for (supported_window_sizes) |supported_size, i| {
+                    str = str ++ std.fmt.comptimePrint(
+                        "        {d}: {d}x{d}\n",
+                        .{ i, supported_size.width, supported_size.height },
+                    );
+                }
+                break :blk str;
+            },
+        });
 
         var local_arena_state = std.heap.ArenaAllocator.init(allocator);
         defer local_arena_state.deinit();
@@ -518,6 +560,17 @@ pub fn main() !void {
 
         const cmdline_parse_result = try argsparse.parseForCurrentProcess(CmdLineSpec, local_arena, .silent);
         const cmdline_options: CmdLineSpec = cmdline_parse_result.options;
+
+        if (cmdline_options.help) {
+            const stdout_writer = std.io.getStdOut().writer();
+
+            try stdout_writer.writeAll("Command line options:\n");
+            inline for (comptime std.enums.values(CmdLineDescription.Key)) |field| {
+                const desc: []const u8 = cmdline_description.get(field);
+                try stdout_writer.writeAll(desc);
+            }
+            return;
+        }
 
         const vertices_data: []const Vertex = vertices_data: {
             var vertices_data = try std.ArrayList(Vertex).initCapacity(allocator, 64);
@@ -741,7 +794,7 @@ pub fn main() !void {
 
         break :physical_device physical_device;
     };
-    const physdev_mem_properties = inst.dsp.getPhysicalDeviceMemoryProperties(physical_device);
+    const physdev_mem_properties = vkutil.getPhysicalDeviceMemoryProperties(inst.dsp, physical_device);
 
     const window_surface: vk.SurfaceKHR = window_surface: {
         var window_surface: vk.SurfaceKHR = .null_handle;
@@ -1292,9 +1345,9 @@ pub fn main() !void {
     });
     defer vkutil.destroyBuffer(allocator, device.dsp, device.handle, vertices_buffer);
 
-    const indices_buffer_len: usize = indices_data.len * @sizeOf(u16);
+    const index_buffer_len: usize = indices_data.len * @sizeOf(u16);
     const index_buffer: vk.Buffer = try vkutil.createBuffer(allocator, device.dsp, device.handle, vkutil.BufferCreateInfo{
-        .size = indices_buffer_len,
+        .size = index_buffer_len,
         .usage = vk.BufferUsageFlags{
             .index_buffer_bit = true,
             .transfer_dst_bit = true,
@@ -1313,11 +1366,13 @@ pub fn main() !void {
             indices_buff_mem_req,
         );
 
-        const memtype_index: u32 = selectMemoryTypeIndex(
+        const memtype_index: u32 = selectMemoryType(
             physdev_mem_properties,
-            .{ .device_local_bit = true },
             combined_requirements,
-        ) orelse return error.NoSuitableMemoryTypesOnSelectedPhysicalDevice;
+            vk.MemoryPropertyFlags{
+                .device_local_bit = true,
+            },
+        ) orelse return error.NoSuitableMemoryTypesOnSelectedPhysicalDeviceFor;
 
         break :vertices_and_indices_mem try vkutil.allocateMemory(allocator, device.dsp, device.handle, vk.MemoryAllocateInfo{
             .allocation_size = combined_requirements.size,
@@ -1331,7 +1386,7 @@ pub fn main() !void {
 
     init_vertices_and_indices_buffers: {
         const staging_buffer: vk.Buffer = try vkutil.createBuffer(allocator, device.dsp, device.handle, vkutil.BufferCreateInfo{
-            .size = combinedMemoryRequirements(vert_buff_mem_req, indices_buff_mem_req).size,
+            .size = vertices_buffer_len + index_buffer_len,
             .usage = vk.BufferUsageFlags{
                 .vertex_buffer_bit = true,
                 .index_buffer_bit = true,
@@ -1347,19 +1402,18 @@ pub fn main() !void {
 
         const staging_buff_mem: vk.DeviceMemory = try vkutil.allocateMemory(allocator, device.dsp, device.handle, vk.MemoryAllocateInfo{
             .allocation_size = staging_buff_mem_req.size,
-            .memory_type_index = selectMemoryTypeIndex(
+            .memory_type_index = selectMemoryType(
                 physdev_mem_properties,
+                staging_buff_mem_req,
                 vk.MemoryPropertyFlags{
                     .host_visible_bit = true,
                     .host_coherent_bit = true,
                 },
-                staging_buff_mem_req,
             ) orelse return error.NoSuitableMemoryTypesOnSelectedPhysicalDeviceForStagingBuffer,
         });
         defer vkutil.freeMemory(allocator, device.dsp, device.handle, staging_buff_mem);
 
         try device.dsp.bindBufferMemory(device.handle, staging_buffer, staging_buff_mem, 0);
-
         init_staging_buffer: {
             const mapped_memory = (try device.dsp.mapMemory(device.handle, staging_buff_mem, 0, staging_buff_mem_req.size, .{})).?;
             defer device.dsp.unmapMemory(device.handle, staging_buff_mem);
@@ -1372,7 +1426,7 @@ pub fn main() !void {
             @memcpy(
                 @ptrCast([*]u8, mapped_memory) + vertices_buffer_len,
                 @ptrCast([*]const u8, indices_data),
-                indices_buffer_len,
+                index_buffer_len,
             );
 
             break :init_staging_buffer;
@@ -1400,7 +1454,7 @@ pub fn main() !void {
             device.dsp.cmdCopyBuffer(copy_cmdbuffer, staging_buffer, index_buffer, 1, &[_]vk.BufferCopy{.{
                 .src_offset = vert_buff_mem_req.size,
                 .dst_offset = 0,
-                .size = indices_buffer_len,
+                .size = index_buffer_len,
             }});
 
             try device.dsp.endCommandBuffer(copy_cmdbuffer);

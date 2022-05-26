@@ -496,6 +496,29 @@ pub fn destroyDebugUtilsMessengerEXT(
     return instance_dsp.destroyDebugUtilsMessengerEXT(instance, messenger, &vkutil.allocCallbacksFrom(&allocator));
 }
 
+pub const PhysicalDeviceMemoryProperties = struct {
+    memory_types: MemoryTypes,
+    memory_heaps: MemoryHeaps,
+
+    pub const MemoryTypes = std.BoundedArray(vk.MemoryType, vk.MAX_MEMORY_TYPES);
+    pub const MemoryHeaps = std.BoundedArray(vk.MemoryHeap, vk.MAX_MEMORY_HEAPS);
+};
+pub fn getPhysicalDeviceMemoryProperties(
+    instance_dsp: anytype,
+    physical_device: vk.PhysicalDevice,
+) vkutil.PhysicalDeviceMemoryProperties {
+    comptime std.debug.assert(isInstanceWrapper(@TypeOf(instance_dsp)));
+    const properties: vk.PhysicalDeviceMemoryProperties = instance_dsp.getPhysicalDeviceMemoryProperties(physical_device);
+
+    const memory_types: []const vk.MemoryType = properties.memory_types[0..properties.memory_type_count];
+    const memory_heaps: []const vk.MemoryHeap = properties.memory_heaps[0..properties.memory_heap_count];
+
+    return vkutil.PhysicalDeviceMemoryProperties{
+        .memory_types = PhysicalDeviceMemoryProperties.MemoryTypes.fromSlice(memory_types) catch unreachable,
+        .memory_heaps = PhysicalDeviceMemoryProperties.MemoryHeaps.fromSlice(memory_heaps) catch unreachable,
+    };
+}
+
 pub const DeviceCreateInfo = struct {
     p_next: ?*const anyopaque = null,
     flags: vk.DeviceCreateFlags = .{},
