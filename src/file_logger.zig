@@ -66,8 +66,3 @@ pub fn log(
 
     writer.print(real_fmt, args) catch return;
 }
-
-fn binaryStringSearch(ctx: void, lhs: []const u8, rhs: []const u8) std.math.Order {
-    ctx;
-    return std.mem.order(u8, lhs, rhs);
-}
