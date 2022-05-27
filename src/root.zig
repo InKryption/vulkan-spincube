@@ -4,6 +4,7 @@ const glfw = @import("glfw");
 const vk = @import("vulkan");
 const vkutil = @import("vkutil.zig");
 const argsparse = @import("MasterQ32/zig-args");
+const zlm = @import("ziglibs/zlm");
 
 const build_options = @import("build_options");
 const shader_bytecode_paths = @import("shader-bytecode-paths");
@@ -278,7 +279,7 @@ const Vertex = extern struct {
     pos: Pos,
     color: Color,
 
-    const Pos = extern struct { x: f32, y: f32 };
+    const Pos = zlm.SpecializeOn(f32).Vec2;
     const Color = extern struct { r: f32, g: f32, b: f32 };
 
     fn bindingDescription(binding: u32) vk.VertexInputBindingDescription {
@@ -301,6 +302,27 @@ const Vertex = extern struct {
                 .color => vk.Format.r32g32b32_sfloat,
             },
             .offset = @offsetOf(Vertex, @tagName(field)),
+        };
+    }
+};
+const UniformBufferObject = extern struct {
+    model: Model,
+    view: View,
+    proj: Projection,
+
+    const Model = zlm.SpecializeOn(f32).Mat4;
+    const View = zlm.SpecializeOn(f32).Mat4;
+    const Projection = zlm.SpecializeOn(f32).Mat4;
+
+    fn descriptorSetLayoutBinding(binding: u32) vk.DescriptorSetLayoutBinding {
+        return vk.DescriptorSetLayoutBinding{
+            .binding = binding,
+            .descriptor_type = .uniform_buffer,
+            .descriptor_count = 1,
+            .stage_flags = vk.ShaderStageFlags{
+                .vertex_bit = true,
+            },
+            .p_immutable_samplers = null,
         };
     }
 };
@@ -352,11 +374,14 @@ const DeviceDispatch = vk.DeviceWrapper(vk.DeviceCommandFlags{
     .createShaderModule = true,
     .destroyShaderModule = true,
 
-    .createGraphicsPipelines = true,
-    .destroyPipeline = true,
-
     .createPipelineLayout = true,
     .destroyPipelineLayout = true,
+
+    .createDescriptorSetLayout = true,
+    .destroyDescriptorSetLayout = true,
+
+    .createGraphicsPipelines = true,
+    .destroyPipeline = true,
 
     .createRenderPass = true,
     .destroyRenderPass = true,
@@ -934,25 +959,23 @@ pub fn main() !void {
     );
     defer swapchain.destroy(allocator, device);
 
-    const graphics_pipeline_layout: vk.PipelineLayout = graphics_pipeline_layout: {
-        const set_layouts = [_]vk.DescriptorSetLayout{};
-        const push_constant_ranges = [_]vk.PushConstantRange{};
+    const graphics_descriptor_set_layout: vk.DescriptorSetLayout = try vkutil.createDescriptorSetLayout(allocator, device.dsp, device.handle, vkutil.DescriptorSetLayoutCreateInfo{
+        .bindings = &[_]vk.DescriptorSetLayoutBinding{
+            UniformBufferObject.descriptorSetLayoutBinding(0),
+        },
+    });
+    defer vkutil.destroyDescriptorSetLayout(allocator, device.dsp, device.handle, graphics_descriptor_set_layout);
 
-        break :graphics_pipeline_layout try device.dsp.createPipelineLayout(
-            device.handle,
-            &vk.PipelineLayoutCreateInfo{
-                .flags = .{},
-
-                .set_layout_count = @intCast(u32, set_layouts.len),
-                .p_set_layouts = std.mem.span(&set_layouts).ptr,
-
-                .push_constant_range_count = @intCast(u32, push_constant_ranges.len),
-                .p_push_constant_ranges = std.mem.span(&push_constant_ranges).ptr,
-            },
-            &vkutil.allocCallbacksFrom(&allocator),
-        );
-    };
-    defer device.dsp.destroyPipelineLayout(device.handle, graphics_pipeline_layout, &vkutil.allocCallbacksFrom(&allocator));
+    const graphics_pipeline_layout: vk.PipelineLayout = try vkutil.createPipelineLayout(
+        allocator,
+        device.dsp,
+        device.handle,
+        vkutil.PipelineLayoutCreateInfo{
+            .set_layouts = &[_]vk.DescriptorSetLayout{graphics_descriptor_set_layout},
+            .push_constant_ranges = &[_]vk.PushConstantRange{},
+        },
+    );
+    defer vkutil.destroyPipelineLayout(allocator, device.dsp, device.handle, graphics_pipeline_layout);
 
     const graphics_render_pass: vk.RenderPass = graphics_render_pass: {
         const attachments = [_]vk.AttachmentDescription{
@@ -1240,9 +1263,10 @@ pub fn main() !void {
 
     const SyncronizedFrame = struct {
         cmdbuffer: vk.CommandBuffer,
+        in_flight: vk.Fence,
         image_available: vk.Semaphore,
         render_finished: vk.Semaphore,
-        in_flight: vk.Fence,
+        uniform_buffer: vk.Buffer,
     };
     const syncronized_frames: std.MultiArrayList(SyncronizedFrame).Slice = syncronized_frames: {
         const syncronized_frames: std.MultiArrayList(SyncronizedFrame).Slice = blk: {
@@ -1314,9 +1338,32 @@ pub fn main() !void {
         try closure.initSemaphores(render_finished_sems);
         errdefer closure.deinitSemaphores(render_finished_sems);
 
+        const uniform_buffers = syncronized_frames.items(.uniform_buffer);
+        for (uniform_buffers) |*uniform_buffer, i| {
+            errdefer for (uniform_buffers[0..i]) |prev| {
+                vkutil.destroyBuffer(allocator, device.dsp, device.handle, prev);
+            };
+
+            uniform_buffer.* = try vkutil.createBuffer(allocator, device.dsp, device.handle, vkutil.BufferCreateInfo{
+                .size = @sizeOf(UniformBufferObject),
+                .usage = vk.BufferUsageFlags{
+                    .uniform_buffer_bit = true,
+                },
+                .sharing_mode = .exclusive,
+                .queue_family_indices = &.{},
+            });
+        }
+        errdefer for (uniform_buffers) |uniform_buffer| {
+            vkutil.destroyBuffer(allocator, device.dsp, device.handle, uniform_buffer);
+        };
+
         break :syncronized_frames syncronized_frames;
     };
     defer {
+        for (syncronized_frames.items(.uniform_buffer)) |uniform_buffer| {
+            vkutil.destroyBuffer(allocator, device.dsp, device.handle, uniform_buffer);
+        }
+
         inline for (.{ .render_finished, .image_available }) |field| {
             for (syncronized_frames.items(field)) |sem| {
                 device.dsp.destroySemaphore(device.handle, sem, &vkutil.allocCallbacksFrom(&allocator));
@@ -1331,6 +1378,39 @@ pub fn main() !void {
 
         var copy = syncronized_frames;
         copy.deinit(allocator);
+    }
+
+    const uniform_buffers_mem: vk.DeviceMemory = uniform_buffers_mem: {
+        const uniform_buffers: []const vk.Buffer = syncronized_frames.items(.uniform_buffer);
+
+        const combined_requirements: vk.MemoryRequirements = combined_requirements: {
+            var combined_requirements = device.dsp.getBufferMemoryRequirements(device.handle, uniform_buffers[0]);
+            for (uniform_buffers[1..]) |subsequent_uniform_buff| {
+                combined_requirements = combinedMemoryRequirements(
+                    combined_requirements,
+                    device.dsp.getBufferMemoryRequirements(device.handle, subsequent_uniform_buff),
+                );
+            }
+            break :combined_requirements combined_requirements;
+        };
+
+        break :uniform_buffers_mem try vkutil.allocateMemory(allocator, device.dsp, device.handle, vk.MemoryAllocateInfo{
+            .allocation_size = combined_requirements.size,
+            .memory_type_index = selectMemoryType(
+                physdev_mem_properties,
+                combined_requirements,
+                vk.MemoryPropertyFlags{
+                    .host_visible_bit = true,
+                    .host_coherent_bit = true,
+                },
+            ) orelse return error.NoSuitableMemoryTypesOnSelectedPhysicalDevice,
+        });
+    };
+    defer vkutil.freeMemory(allocator, device.dsp, device.handle, uniform_buffers_mem);
+
+    // bind uniform buffer memory
+    for (syncronized_frames.items(.uniform_buffer)) |uniform_buffer, i| {
+        try device.dsp.bindBufferMemory(device.handle, uniform_buffer, uniform_buffers_mem, @sizeOf(UniformBufferObject) * i);
     }
 
     const vertices_buffer_len: usize = vertices_data.len * @sizeOf(Vertex);
@@ -1372,7 +1452,7 @@ pub fn main() !void {
             vk.MemoryPropertyFlags{
                 .device_local_bit = true,
             },
-        ) orelse return error.NoSuitableMemoryTypesOnSelectedPhysicalDeviceFor;
+        ) orelse return error.NoSuitableMemoryTypesOnSelectedPhysicalDevice;
 
         break :vertices_and_indices_mem try vkutil.allocateMemory(allocator, device.dsp, device.handle, vk.MemoryAllocateInfo{
             .allocation_size = combined_requirements.size,
@@ -1409,22 +1489,22 @@ pub fn main() !void {
                     .host_visible_bit = true,
                     .host_coherent_bit = true,
                 },
-            ) orelse return error.NoSuitableMemoryTypesOnSelectedPhysicalDeviceForStagingBuffer,
+            ) orelse return error.NoSuitableMemoryTypesOnSelectedPhysicalDevice,
         });
         defer vkutil.freeMemory(allocator, device.dsp, device.handle, staging_buff_mem);
 
         try device.dsp.bindBufferMemory(device.handle, staging_buffer, staging_buff_mem, 0);
         init_staging_buffer: {
-            const mapped_memory = (try device.dsp.mapMemory(device.handle, staging_buff_mem, 0, staging_buff_mem_req.size, .{})).?;
+            const mapped_memory = @ptrCast([*]u8, (try device.dsp.mapMemory(device.handle, staging_buff_mem, 0, staging_buff_mem_req.size, .{})).?);
             defer device.dsp.unmapMemory(device.handle, staging_buff_mem);
 
             @memcpy(
-                @ptrCast([*]u8, mapped_memory),
+                mapped_memory,
                 @ptrCast([*]const u8, vertices_data),
                 vertices_buffer_len,
             );
             @memcpy(
-                @ptrCast([*]u8, mapped_memory) + vertices_buffer_len,
+                mapped_memory + vertices_buffer_len,
                 @ptrCast([*]const u8, indices_data),
                 index_buffer_len,
             );
@@ -1485,13 +1565,17 @@ pub fn main() !void {
     var current_frame: u32 = 0;
     defer device.dsp.deviceWaitIdle(device.handle) catch |err| std.log.err("deviceWaitIdle: {s}", .{@errorName(err)});
 
-    var timer = try std.time.Timer.start();
+    var frame_timer = try std.time.Timer.start();
+    var ubo_timer = std.time.Timer.start() catch unreachable;
+
+    const ubo_start_time: u64 = ubo_timer.read();
+
     mainloop: while (!window.shouldClose()) {
         try glfw.pollEvents();
         if (!window_data.we_are_in_focus) continue;
 
-        if (timer.read() >= 16 * std.time.ns_per_ms) {
-            timer.reset();
+        if (frame_timer.read() >= 16 * std.time.ns_per_ms) {
+            frame_timer.reset();
         } else continue :mainloop;
 
         handle_framebuffer_resizes: {
@@ -1607,6 +1691,43 @@ pub fn main() !void {
 
                 try device.dsp.endCommandBuffer(cmdbuffer);
                 break :record_command_buffer;
+            }
+
+            update_uniform_buffer: {
+                const time_since_start = @intToFloat(f32, ubo_timer.read() - ubo_start_time) / @intToFloat(f32, std.time.ns_per_s);
+
+                var ubo = UniformBufferObject{
+                    .model = UniformBufferObject.Model.identity.mul(UniformBufferObject.Model.createAngleAxis(
+                        zlm.SpecializeOn(f32).Vec3.new(0, 0, 1),
+                        time_since_start * zlm.toRadians(90.0),
+                    )),
+                    .view = UniformBufferObject.View.createLookAt(
+                        .{ .x = 2.0, .y = 2.0, .z = 2.0 },
+                        .{ .x = 0.0, .y = 0.0, .z = 0.0 },
+                        .{ .x = 0.0, .y = 0.0, .z = 1.0 },
+                    ),
+                    .proj = UniformBufferObject.Projection.createPerspective(
+                        zlm.toRadians(45.0),
+                        @intToFloat(f32, swapchain.details.extent.width / swapchain.details.extent.height),
+                        0.1,
+                        10.0,
+                    ),
+                };
+
+                // TODO: from tutorial; is it necessary?
+                ubo.proj.fields[0][0] = -1;
+
+                const mapped_memory = @ptrCast([*]u8, (try device.dsp.mapMemory(
+                    device.handle,
+                    uniform_buffers_mem,
+                    @sizeOf(UniformBufferObject) * current_frame,
+                    @sizeOf(UniformBufferObject),
+                    .{},
+                )).?);
+                defer device.dsp.unmapMemory(device.handle, uniform_buffers_mem);
+
+                @memcpy(mapped_memory, @ptrCast([*]const u8, &ubo), @sizeOf(UniformBufferObject));
+                break :update_uniform_buffer;
             }
 
             const wait_semaphores: []const vk.Semaphore = &.{image_available};

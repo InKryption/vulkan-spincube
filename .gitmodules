@@ -10,3 +10,6 @@
 [submodule "dep/MasterQ32/zig-args"]
 	path = dep/MasterQ32/zig-args
 	url = https://github.com/MasterQ32/zig-args.git
+[submodule "dep/ziglibs/zlm"]
+	path = dep/ziglibs/zlm
+	url = https://github.com/ziglibs/zlm

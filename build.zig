@@ -31,8 +31,13 @@ pub fn build(b: *std.build.Builder) void {
         .name = "MasterQ32/zig-args",
         .path = .{ .path = "dep/MasterQ32/zig-args/args.zig" },
     };
+    const zlm = std.build.Pkg{
+        .name = "ziglibs/zlm",
+        .path = .{ .path = "dep/ziglibs/zlm/zlm.zig" },
+    };
 
     exe.addPackage(@"zig-args");
+    exe.addPackage(zlm);
 
     const vk_shader_compile_step = vk.ShaderCompileStep.init(b, &.{"glslc"}, "shader-bytecode");
     exe.step.dependOn(&vk_shader_compile_step.step);

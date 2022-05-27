@@ -646,6 +646,77 @@ pub fn destroyImageView(
     return device_dsp.destroyImageView(device, image_view, &vkutil.allocCallbacksFrom(&allocator));
 }
 
+pub const DescriptorSetLayoutCreateInfo = struct {
+    p_next: ?*const anyopaque = null,
+    flags: vk.DescriptorSetLayoutCreateFlags = .{},
+    bindings: []const vk.DescriptorSetLayoutBinding,
+};
+pub fn createDescriptorSetLayout(
+    allocator: std.mem.Allocator,
+    device_dsp: anytype,
+    device: vk.Device,
+    create_info: DescriptorSetLayoutCreateInfo,
+) @TypeOf(device_dsp).CreateDescriptorSetLayoutError!vk.DescriptorSetLayout {
+    comptime std.debug.assert(isDeviceWrapper(@TypeOf(device_dsp)));
+    return device_dsp.createDescriptorSetLayout(
+        device,
+        &vk.DescriptorSetLayoutCreateInfo{
+            .p_next = create_info.p_next,
+            .flags = create_info.flags,
+            .binding_count = @intCast(u32, create_info.bindings.len),
+            .p_bindings = create_info.bindings.ptr,
+        },
+        &vkutil.allocCallbacksFrom(&allocator),
+    );
+}
+pub fn destroyDescriptorSetLayout(
+    allocator: std.mem.Allocator,
+    device_dsp: anytype,
+    device: vk.Device,
+    descriptor_set_layout: vk.DescriptorSetLayout,
+) void {
+    comptime std.debug.assert(isDeviceWrapper(@TypeOf(device_dsp)));
+    return device_dsp.destroyDescriptorSetLayout(
+        device,
+        descriptor_set_layout,
+        &vkutil.allocCallbacksFrom(&allocator),
+    );
+}
+
+pub const PipelineLayoutCreateInfo = struct {
+    p_next: ?*const anyopaque = null,
+    flags: vk.PipelineLayoutCreateFlags = .{},
+    set_layouts: []const vk.DescriptorSetLayout,
+    push_constant_ranges: []const vk.PushConstantRange,
+};
+pub fn createPipelineLayout(
+    allocator: std.mem.Allocator,
+    device_dsp: anytype,
+    device: vk.Device,
+    create_info: PipelineLayoutCreateInfo,
+) @TypeOf(device_dsp).CreatePipelineLayoutError!vk.PipelineLayout {
+    comptime std.debug.assert(isDeviceWrapper(@TypeOf(device_dsp)));
+    return device_dsp.createPipelineLayout(device, &vk.PipelineLayoutCreateInfo{
+        .p_next = create_info.p_next,
+        .flags = create_info.flags,
+
+        .set_layout_count = @intCast(u32, create_info.set_layouts.len),
+        .p_set_layouts = create_info.set_layouts.ptr,
+
+        .push_constant_range_count = @intCast(u32, create_info.push_constant_ranges.len),
+        .p_push_constant_ranges = create_info.push_constant_ranges.ptr,
+    }, &vkutil.allocCallbacksFrom(&allocator));
+}
+pub fn destroyPipelineLayout(
+    allocator: std.mem.Allocator,
+    device_dsp: anytype,
+    device: vk.Device,
+    pipeline_layout: vk.PipelineLayout,
+) void {
+    comptime std.debug.assert(isDeviceWrapper(@TypeOf(device_dsp)));
+    return device_dsp.destroyPipelineLayout(device, pipeline_layout, &vkutil.allocCallbacksFrom(&allocator));
+}
+
 pub const BufferCreateInfo = struct {
     p_next: ?*const anyopaque = null,
     flags: vk.BufferCreateFlags = .{},
@@ -662,6 +733,7 @@ pub fn createBuffer(
     device: vk.Device,
     create_info: BufferCreateInfo,
 ) @TypeOf(device_dsp).CreateBufferError!vk.Buffer {
+    comptime std.debug.assert(isDeviceWrapper(@TypeOf(device_dsp)));
     return device_dsp.createBuffer(device, &vk.BufferCreateInfo{
         .p_next = create_info.p_next,
         .flags = create_info.flags,
@@ -681,6 +753,7 @@ pub fn destroyBuffer(
     device: vk.Device,
     buffer: vk.Buffer,
 ) void {
+    comptime std.debug.assert(isDeviceWrapper(@TypeOf(device_dsp)));
     return device_dsp.destroyBuffer(device, buffer, &vkutil.allocCallbacksFrom(&allocator));
 }
 
@@ -690,6 +763,7 @@ pub fn allocateMemory(
     device: vk.Device,
     allocate_info: vk.MemoryAllocateInfo,
 ) @TypeOf(device_dsp).AllocateMemoryError!vk.DeviceMemory {
+    comptime std.debug.assert(isDeviceWrapper(@TypeOf(device_dsp)));
     return device_dsp.allocateMemory(device, &allocate_info, &vkutil.allocCallbacksFrom(&allocator));
 }
 pub fn freeMemory(
@@ -698,5 +772,6 @@ pub fn freeMemory(
     device: vk.Device,
     memory: vk.DeviceMemory,
 ) void {
+    comptime std.debug.assert(isDeviceWrapper(@TypeOf(device_dsp)));
     return device_dsp.freeMemory(device, memory, &vkutil.allocCallbacksFrom(&allocator));
 }
