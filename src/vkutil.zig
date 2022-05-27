@@ -655,7 +655,7 @@ pub fn createDescriptorSetLayout(
     allocator: std.mem.Allocator,
     device_dsp: anytype,
     device: vk.Device,
-    create_info: DescriptorSetLayoutCreateInfo,
+    create_info: vkutil.DescriptorSetLayoutCreateInfo,
 ) @TypeOf(device_dsp).CreateDescriptorSetLayoutError!vk.DescriptorSetLayout {
     comptime std.debug.assert(isDeviceWrapper(@TypeOf(device_dsp)));
     return device_dsp.createDescriptorSetLayout(
@@ -774,4 +774,126 @@ pub fn freeMemory(
 ) void {
     comptime std.debug.assert(isDeviceWrapper(@TypeOf(device_dsp)));
     return device_dsp.freeMemory(device, memory, &vkutil.allocCallbacksFrom(&allocator));
+}
+
+pub const DescriptorPoolCreateInfo = struct {
+    p_next: ?*const anyopaque = null,
+    flags: vk.DescriptorPoolCreateFlags = .{},
+    max_sets: u32,
+    pool_sizes: []const vk.DescriptorPoolSize,
+};
+pub fn createDescriptorPool(
+    allocator: std.mem.Allocator,
+    device_dsp: anytype,
+    device: vk.Device,
+    create_info: vkutil.DescriptorPoolCreateInfo,
+) @TypeOf(device_dsp).CreateDescriptorPoolError!vk.DescriptorPool {
+    comptime std.debug.assert(isDeviceWrapper(@TypeOf(device_dsp)));
+    return device_dsp.createDescriptorPool(device, &vk.DescriptorPoolCreateInfo{
+        .p_next = create_info.p_next,
+        .flags = create_info.flags,
+        .max_sets = create_info.max_sets,
+        .pool_size_count = @intCast(u32, create_info.pool_sizes.len),
+        .p_pool_sizes = create_info.pool_sizes.ptr,
+    }, &vkutil.allocCallbacksFrom(&allocator));
+}
+pub fn destroyDescriptorPool(
+    allocator: std.mem.Allocator,
+    device_dsp: anytype,
+    device: vk.Device,
+    descriptor_pool: vk.DescriptorPool,
+) void {
+    comptime std.debug.assert(isDeviceWrapper(@TypeOf(device_dsp)));
+    return device_dsp.destroyDescriptorPool(device, descriptor_pool, &vkutil.allocCallbacksFrom(&allocator));
+}
+
+pub const DescriptorSetAllocateInfo = struct {
+    p_next: ?*const anyopaque = null,
+    descriptor_pool: vk.DescriptorPool,
+    set_layouts: []const vk.DescriptorSetLayout,
+};
+pub fn allocateDescriptorSets(
+    device_dsp: anytype,
+    device: vk.Device,
+    allocate_info: vkutil.DescriptorSetAllocateInfo,
+    descriptor_sets: []vk.DescriptorSet,
+) @TypeOf(device_dsp).AllocateDescriptorSetsError!void {
+    comptime std.debug.assert(isDeviceWrapper(@TypeOf(device_dsp)));
+    std.debug.assert(descriptor_sets.len == allocate_info.set_layouts.len);
+
+    return device_dsp.allocateDescriptorSets(device, &vk.DescriptorSetAllocateInfo{
+        .p_next = allocate_info.p_next,
+        .descriptor_pool = allocate_info.descriptor_pool,
+
+        .descriptor_set_count = @intCast(u32, descriptor_sets.len),
+        .p_set_layouts = allocate_info.set_layouts.ptr,
+    }, descriptor_sets.ptr);
+}
+pub fn freeDescriptorSets(
+    device_dsp: anytype,
+    device: vk.Device,
+    descriptor_pool: vk.DescriptorPool,
+    descriptor_sets: []const vk.DescriptorSet,
+) @TypeOf(device_dsp).FreeDescriptorSetsError!void {
+    comptime std.debug.assert(isDeviceWrapper(@TypeOf(device_dsp)));
+    return device_dsp.freeDescriptorSets(device, descriptor_pool, @intCast(u32, descriptor_sets.len), descriptor_sets.ptr);
+}
+
+pub fn updateDescriptorSets(
+    device_dsp: anytype,
+    device: vk.Device,
+    descriptor_writes: []const vk.WriteDescriptorSet,
+    descriptor_copies: []const vk.CopyDescriptorSet,
+) void {
+    comptime std.debug.assert(isDeviceWrapper(@TypeOf(device_dsp)));
+    return device_dsp.updateDescriptorSets(
+        device,
+        @intCast(u32, descriptor_writes.len),
+        descriptor_writes.ptr,
+        @intCast(u32, descriptor_copies.len),
+        descriptor_copies.ptr,
+    );
+}
+
+pub const RenderPassBeginInfo = struct {
+    p_next: ?*const anyopaque = null,
+    render_pass: vk.RenderPass,
+    framebuffer: vk.Framebuffer,
+    render_area: vk.Rect2D,
+    clear_values: []const vk.ClearValue,
+};
+pub fn cmdBeginRenderPass(
+    device_dsp: anytype,
+    command_buffer: vk.CommandBuffer,
+    render_pass_begin: vkutil.RenderPassBeginInfo,
+    contents: vk.SubpassContents,
+) void {
+    comptime std.debug.assert(isDeviceWrapper(@TypeOf(device_dsp)));
+    return device_dsp.cmdBeginRenderPass(command_buffer, &vk.RenderPassBeginInfo{
+        .p_next = render_pass_begin.p_next,
+        .render_pass = render_pass_begin.render_pass,
+        .framebuffer = render_pass_begin.framebuffer,
+        .render_area = render_pass_begin.render_area,
+        .clear_value_count = @intCast(u32, render_pass_begin.clear_values.len),
+        .p_clear_values = render_pass_begin.clear_values.ptr,
+    }, contents);
+}
+
+/// asserts that `buffers.len == offsets.len`.
+pub fn cmdBindVertexBuffers(
+    device_dsp: anytype,
+    command_buffer: vk.CommandBuffer,
+    first_binding: u32,
+    buffers: []const vk.Buffer,
+    offsets: []const vk.DeviceSize,
+) void {
+    comptime std.debug.assert(isDeviceWrapper(@TypeOf(device_dsp)));
+    std.debug.assert(buffers.len == offsets.len);
+    return device_dsp.cmdBindVertexBuffers(
+        command_buffer,
+        first_binding,
+        @intCast(u32, buffers.len),
+        buffers.ptr,
+        offsets.ptr,
+    );
 }

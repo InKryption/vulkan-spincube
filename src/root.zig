@@ -392,6 +392,14 @@ const DeviceDispatch = vk.DeviceWrapper(vk.DeviceCommandFlags{
     .createCommandPool = true,
     .destroyCommandPool = true,
 
+    .createDescriptorPool = true,
+    .destroyDescriptorPool = true,
+
+    .allocateDescriptorSets = true,
+    .freeDescriptorSets = true,
+
+    .updateDescriptorSets = true,
+
     .createSemaphore = true,
     .destroySemaphore = true,
 
@@ -420,6 +428,7 @@ const DeviceDispatch = vk.DeviceWrapper(vk.DeviceCommandFlags{
     .cmdBindVertexBuffers = true,
     .cmdBindIndexBuffer = true,
     // .cmdDraw = true,
+    .cmdBindDescriptorSets = true,
     .cmdDrawIndexed = true,
 
     .acquireNextImageKHR = true,
@@ -540,8 +549,16 @@ pub fn main() !void {
     try file_logger.init("vulkan-spincube.log", .{ .stderr_level = .warn });
     defer file_logger.deinit();
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{ .safety = true, .verbose_log = false, .stack_trace_frames = 8 }){};
+    var gpa = std.heap.GeneralPurposeAllocator(.{
+        .safety = true,
+        .verbose_log = true,
+        .stack_trace_frames = 32,
+        .retain_metadata = true,
+    }){};
     defer _ = gpa.deinit();
+
+    var logging_allocator_state = std.heap.loggingAllocator(gpa.allocator());
+    const logging_allocator = logging_allocator_state.allocator();
 
     const allocator: std.mem.Allocator = gpa.allocator();
 
@@ -959,12 +976,24 @@ pub fn main() !void {
     );
     defer swapchain.destroy(allocator, device);
 
-    const graphics_descriptor_set_layout: vk.DescriptorSetLayout = try vkutil.createDescriptorSetLayout(allocator, device.dsp, device.handle, vkutil.DescriptorSetLayoutCreateInfo{
-        .bindings = &[_]vk.DescriptorSetLayoutBinding{
-            UniformBufferObject.descriptorSetLayoutBinding(0),
+    // NOTE: It doesn't use the allocator ????????????
+    // TODO: fix ???? how ???
+    const graphics_descriptor_set_layout: vk.DescriptorSetLayout = try vkutil.createDescriptorSetLayout(
+        logging_allocator,
+        device.dsp,
+        device.handle,
+        vkutil.DescriptorSetLayoutCreateInfo{
+            .bindings = &[_]vk.DescriptorSetLayoutBinding{
+                UniformBufferObject.descriptorSetLayoutBinding(0),
+            },
         },
-    });
-    defer vkutil.destroyDescriptorSetLayout(allocator, device.dsp, device.handle, graphics_descriptor_set_layout);
+    );
+    defer vkutil.destroyDescriptorSetLayout(
+        logging_allocator,
+        device.dsp,
+        device.handle,
+        graphics_descriptor_set_layout,
+    );
 
     const graphics_pipeline_layout: vk.PipelineLayout = try vkutil.createPipelineLayout(
         allocator,
@@ -1261,12 +1290,29 @@ pub fn main() !void {
     }, &vkutil.allocCallbacksFrom(&allocator));
     defer device.dsp.destroyCommandPool(device.handle, copying_cmdpool, &vkutil.allocCallbacksFrom(&allocator));
 
+    const graphics_descriptor_pool: vk.DescriptorPool = try vkutil.createDescriptorPool(allocator, device.dsp, device.handle, vkutil.DescriptorPoolCreateInfo{
+        .flags = vk.DescriptorPoolCreateFlags{
+            // so we don't have to manually call `freeDescriptorSets`.
+            .free_descriptor_set_bit = false,
+        },
+        .max_sets = max_frames_in_flight,
+        .pool_sizes = &[_]vk.DescriptorPoolSize{.{
+            .type = .uniform_buffer,
+            .descriptor_count = max_frames_in_flight,
+        }},
+    });
+    defer vkutil.destroyDescriptorPool(allocator, device.dsp, device.handle, graphics_descriptor_pool);
+
+    // the length in bytes of every individual uniform buffer in the `synchronized_frames` multi slice
+    const uniform_buffers_len: usize = @sizeOf(UniformBufferObject);
+
     const SyncronizedFrame = struct {
         cmdbuffer: vk.CommandBuffer,
         in_flight: vk.Fence,
         image_available: vk.Semaphore,
         render_finished: vk.Semaphore,
         uniform_buffer: vk.Buffer,
+        descriptor_set: vk.DescriptorSet,
     };
     const syncronized_frames: std.MultiArrayList(SyncronizedFrame).Slice = syncronized_frames: {
         const syncronized_frames: std.MultiArrayList(SyncronizedFrame).Slice = blk: {
@@ -1345,7 +1391,7 @@ pub fn main() !void {
             };
 
             uniform_buffer.* = try vkutil.createBuffer(allocator, device.dsp, device.handle, vkutil.BufferCreateInfo{
-                .size = @sizeOf(UniformBufferObject),
+                .size = uniform_buffers_len,
                 .usage = vk.BufferUsageFlags{
                     .uniform_buffer_bit = true,
                 },
@@ -1357,9 +1403,31 @@ pub fn main() !void {
             vkutil.destroyBuffer(allocator, device.dsp, device.handle, uniform_buffer);
         };
 
+        try vkutil.allocateDescriptorSets(device.dsp, device.handle, vkutil.DescriptorSetAllocateInfo{
+            .descriptor_pool = graphics_descriptor_pool,
+            .set_layouts = &set_layouts: {
+                var set_layouts = [_]vk.DescriptorSetLayout{.null_handle} ** max_frames_in_flight;
+                std.mem.set(vk.DescriptorSetLayout, &set_layouts, graphics_descriptor_set_layout);
+                break :set_layouts set_layouts;
+            },
+        }, syncronized_frames.items(.descriptor_set));
+        // NOTE: here would be the errdefer'd call to `freeDescriptorSets`, but it's not allowed
+        // when not setting the `free_descriptor_set_bit` flag in the creation of the
+        // associated descriptor pool.
+        // vkutil.freeDescriptorSets(device.dsp, device.handle, graphics_descriptor_pool, syncronized_frames.items(.descriptor_set)) catch |err| {
+        //     std.log.err("freeDescriptorSets: {s}", .{@errorName(err)});
+        // };
+
         break :syncronized_frames syncronized_frames;
     };
     defer {
+        // NOTE: here would be the call to `freeDescriptorSets`, but it's not allowed
+        // when not setting the `free_descriptor_set_bit` flag in the creation of the
+        // associated descriptor pool.
+        // vkutil.freeDescriptorSets(device.dsp, device.handle, graphics_descriptor_pool, syncronized_frames.items(.descriptor_set)) catch |err| {
+        //     std.log.err("freeDescriptorSets: {s}", .{@errorName(err)});
+        // };
+
         for (syncronized_frames.items(.uniform_buffer)) |uniform_buffer| {
             vkutil.destroyBuffer(allocator, device.dsp, device.handle, uniform_buffer);
         }
@@ -1408,9 +1476,36 @@ pub fn main() !void {
     };
     defer vkutil.freeMemory(allocator, device.dsp, device.handle, uniform_buffers_mem);
 
-    // bind uniform buffer memory
-    for (syncronized_frames.items(.uniform_buffer)) |uniform_buffer, i| {
-        try device.dsp.bindBufferMemory(device.handle, uniform_buffer, uniform_buffers_mem, @sizeOf(UniformBufferObject) * i);
+    init_ubo_buff_and_descriptor_sets: {
+        for (syncronized_frames.items(.uniform_buffer)) |uniform_buffer, i| {
+            try device.dsp.bindBufferMemory(device.handle, uniform_buffer, uniform_buffers_mem, uniform_buffers_len * i);
+        }
+
+        const uniform_buffers: []const vk.Buffer = syncronized_frames.items(.uniform_buffer);
+        const descriptor_sets: []const vk.DescriptorSet = syncronized_frames.items(.descriptor_set);
+
+        {
+            var i: usize = 0;
+            while (i < max_frames_in_flight) : (i += 1) {
+                const descriptor_write = [_]vk.WriteDescriptorSet{.{
+                    .dst_set = descriptor_sets[i],
+                    .dst_binding = 0,
+                    .dst_array_element = 0,
+                    .descriptor_type = .uniform_buffer,
+                    .descriptor_count = 1,
+                    .p_buffer_info = &[_]vk.DescriptorBufferInfo{.{
+                        .buffer = uniform_buffers[i],
+                        .offset = 0,
+                        .range = uniform_buffers_len,
+                    }},
+                    .p_image_info = emptySlice(vk.DescriptorImageInfo).ptr,
+                    .p_texel_buffer_view = emptySlice(vk.BufferView).ptr,
+                }};
+                vkutil.updateDescriptorSets(device.dsp, device.handle, &descriptor_write, emptySlice(vk.CopyDescriptorSet));
+            }
+        }
+
+        break :init_ubo_buff_and_descriptor_sets;
     }
 
     const vertices_buffer_len: usize = vertices_data.len * @sizeOf(Vertex);
@@ -1561,6 +1656,7 @@ pub fn main() !void {
     const image_available_slice: []const vk.Semaphore = syncronized_frames.items(.image_available);
     const render_finished_slice: []const vk.Semaphore = syncronized_frames.items(.render_finished);
     const cmdbuffer_slice: []const vk.CommandBuffer = syncronized_frames.items(.cmdbuffer);
+    const descriptor_set_slice: []const vk.DescriptorSet = syncronized_frames.items(.descriptor_set);
 
     var current_frame: u32 = 0;
     defer device.dsp.deviceWaitIdle(device.handle) catch |err| std.log.err("deviceWaitIdle: {s}", .{@errorName(err)});
@@ -1610,6 +1706,7 @@ pub fn main() !void {
             const image_available: vk.Semaphore = image_available_slice[current_frame];
             const render_finished: vk.Semaphore = render_finished_slice[current_frame];
             const cmdbuffer: vk.CommandBuffer = cmdbuffer_slice[current_frame];
+            const descriptor_set: vk.DescriptorSet = descriptor_set_slice[current_frame];
             current_frame = (current_frame + 1) % max_frames_in_flight;
 
             if (device.dsp.waitForFences(device.handle, 1, @ptrCast(*const [1]vk.Fence, &in_flight), vk.TRUE, std.math.maxInt(u64))) |result| {
@@ -1663,16 +1760,14 @@ pub fn main() !void {
                     .extent = swapchain.details.extent,
                 }});
 
-                device.dsp.cmdBeginRenderPass(cmdbuffer, &vk.RenderPassBeginInfo{
+                vkutil.cmdBeginRenderPass(device.dsp, cmdbuffer, vkutil.RenderPassBeginInfo{
                     .render_pass = graphics_render_pass,
                     .framebuffer = swapchain_framebuffers.items[image_index],
                     .render_area = vk.Rect2D{
                         .offset = vk.Offset2D{ .x = 0, .y = 0 },
                         .extent = swapchain.details.extent,
                     },
-
-                    .clear_value_count = 1,
-                    .p_clear_values = &[_]vk.ClearValue{.{
+                    .clear_values = &[_]vk.ClearValue{.{
                         .color = vk.ClearColorValue{ .float_32 = [4]f32{
                             0.0,
                             0.0,
@@ -1684,7 +1779,9 @@ pub fn main() !void {
 
                 device.dsp.cmdBindPipeline(cmdbuffer, .graphics, graphics_pipeline);
                 device.dsp.cmdBindVertexBuffers(cmdbuffer, 0, 1, &[_]vk.Buffer{vertices_buffer}, &[_]vk.DeviceSize{0});
+                vkutil.cmdBindVertexBuffers(device.dsp, cmdbuffer, 0, &.{vertices_buffer}, &.{0});
                 device.dsp.cmdBindIndexBuffer(cmdbuffer, index_buffer, 0, vk.IndexType.uint16);
+                device.dsp.cmdBindDescriptorSets(cmdbuffer, .graphics, graphics_pipeline_layout, 0, 1, @ptrCast([*]const vk.DescriptorSet, &descriptor_set), 0, emptySlice(u32).ptr);
                 device.dsp.cmdDrawIndexed(cmdbuffer, @intCast(u32, indices_data.len), 1, 0, 0, 0);
 
                 device.dsp.cmdEndRenderPass(cmdbuffer);
@@ -1720,13 +1817,14 @@ pub fn main() !void {
                 const mapped_memory = @ptrCast([*]u8, (try device.dsp.mapMemory(
                     device.handle,
                     uniform_buffers_mem,
-                    @sizeOf(UniformBufferObject) * current_frame,
-                    @sizeOf(UniformBufferObject),
+                    uniform_buffers_len * current_frame,
+                    uniform_buffers_len,
                     .{},
                 )).?);
                 defer device.dsp.unmapMemory(device.handle, uniform_buffers_mem);
 
-                @memcpy(mapped_memory, @ptrCast([*]const u8, &ubo), @sizeOf(UniformBufferObject));
+                @memcpy(mapped_memory, @ptrCast([*]const u8, &ubo), uniform_buffers_len);
+
                 break :update_uniform_buffer;
             }
 
@@ -1768,4 +1866,9 @@ pub fn main() !void {
             break :draw_frame;
         }
     }
+}
+
+/// Returns an empty slice of `T`.
+fn emptySlice(comptime T: type) []T {
+    return &.{};
 }
