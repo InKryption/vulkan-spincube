@@ -1633,9 +1633,7 @@ pub fn main() !void {
     var current_frame: u32 = 0;
     defer device.dsp.deviceWaitIdle(device.handle) catch |err| std.log.err("deviceWaitIdle: {s}", .{@errorName(err)});
 
-    // var frame_timer = try std.time.Timer.start();
     var ubo_timer = std.time.Timer.start() catch unreachable;
-
     const ubo_start_time: u64 = ubo_timer.read();
 
     mainloop: while (!window.shouldClose()) {
