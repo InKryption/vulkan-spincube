@@ -978,8 +978,9 @@ pub fn main() !void {
     );
     defer swapchain.destroy(allocator, device);
 
-    // NOTE: It doesn't use the allocator ????????????
-    // TODO: fix ???? how ???
+    // NOTE: This currently causes a leak on my laptop, and it seems to be because the implementation is ignoring the
+    // provided AllocationCallbacks.
+    // TODO: Look into filing a bug report on this or something
     const graphics_descriptor_set_layout: vk.DescriptorSetLayout = try vkutil.createDescriptorSetLayout(
         logging_allocator,
         device.dsp,
@@ -1632,7 +1633,7 @@ pub fn main() !void {
     var current_frame: u32 = 0;
     defer device.dsp.deviceWaitIdle(device.handle) catch |err| std.log.err("deviceWaitIdle: {s}", .{@errorName(err)});
 
-    var frame_timer = try std.time.Timer.start();
+    // var frame_timer = try std.time.Timer.start();
     var ubo_timer = std.time.Timer.start() catch unreachable;
 
     const ubo_start_time: u64 = ubo_timer.read();
@@ -1640,10 +1641,6 @@ pub fn main() !void {
     mainloop: while (!window.shouldClose()) {
         try glfw.pollEvents();
         if (!window_data.we_are_in_focus) continue;
-
-        if (frame_timer.read() >= 16 * std.time.ns_per_ms) {
-            frame_timer.reset();
-        } else continue :mainloop;
 
         handle_framebuffer_resizes: {
             const fbsize: vk.Extent2D = fbsize: {
