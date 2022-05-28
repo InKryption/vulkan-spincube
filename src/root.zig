@@ -559,9 +559,6 @@ pub fn main() !void {
     }){};
     defer _ = gpa.deinit();
 
-    var logging_allocator_state = std.heap.loggingAllocator(gpa.allocator());
-    const logging_allocator = logging_allocator_state.allocator();
-
     const allocator: std.mem.Allocator = gpa.allocator();
 
     try glfw.init(.{});
@@ -982,7 +979,7 @@ pub fn main() !void {
     // provided AllocationCallbacks.
     // TODO: Look into filing a bug report on this or something
     const graphics_descriptor_set_layout: vk.DescriptorSetLayout = try vkutil.createDescriptorSetLayout(
-        logging_allocator,
+        allocator,
         device.dsp,
         device.handle,
         vkutil.DescriptorSetLayoutCreateInfo{
@@ -992,7 +989,7 @@ pub fn main() !void {
         },
     );
     defer vkutil.destroyDescriptorSetLayout(
-        logging_allocator,
+        allocator,
         device.dsp,
         device.handle,
         graphics_descriptor_set_layout,
