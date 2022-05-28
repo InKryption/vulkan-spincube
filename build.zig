@@ -29,11 +29,11 @@ pub fn build(b: *std.build.Builder) void {
 
     const @"zig-args" = std.build.Pkg{
         .name = "MasterQ32/zig-args",
-        .path = .{ .path = "dep/MasterQ32/zig-args/args.zig" },
+        .source = .{ .path = "dep/MasterQ32/zig-args/args.zig" },
     };
     const zlm = std.build.Pkg{
         .name = "ziglibs/zlm",
-        .path = .{ .path = "dep/ziglibs/zlm/zlm.zig" },
+        .source = .{ .path = "dep/ziglibs/zlm/zlm.zig" },
     };
 
     exe.addPackage(@"zig-args");
