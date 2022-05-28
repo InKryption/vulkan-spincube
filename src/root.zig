@@ -1630,12 +1630,28 @@ pub fn main() !void {
     var current_frame: u32 = 0;
     defer device.dsp.deviceWaitIdle(device.handle) catch |err| std.log.err("deviceWaitIdle: {s}", .{@errorName(err)});
 
+    var frame_timer = try std.time.Timer.start();
     var ubo_timer = std.time.Timer.start() catch unreachable;
     const ubo_start_time: u64 = ubo_timer.read();
+
+    const uniform_buffer_mapped_memory = @ptrCast([*]u8, (try device.dsp.mapMemory(
+        device.handle,
+        uniform_buffers_mem,
+        0,
+        uniform_buffer_total_len,
+        .{},
+    )).?)[0..uniform_buffer_total_len];
+    defer device.dsp.unmapMemory(device.handle, uniform_buffers_mem);
+
+    var frames_per_second : u8 = 60;
 
     mainloop: while (!window.shouldClose()) {
         try glfw.pollEvents();
         if (!window_data.we_are_in_focus) continue;
+
+        if (frame_timer.read() < (1000 * std.time.ns_per_ms) / @as(u64, frames_per_second)) {
+            continue :mainloop;
+        } else frame_timer.reset();
 
         handle_framebuffer_resizes: {
             const fbsize: vk.Extent2D = fbsize: {
@@ -1780,17 +1796,7 @@ pub fn main() !void {
                     break :ubo ubo;
                 };
 
-                const mapped_memory = @ptrCast([*]u8, (try device.dsp.mapMemory(
-                    device.handle,
-                    uniform_buffers_mem,
-                    uniform_buffer_segment_len * current_frame,
-                    uniform_buffer_segment_len,
-                    .{},
-                )).?);
-                defer device.dsp.unmapMemory(device.handle, uniform_buffers_mem);
-
-                @memcpy(mapped_memory, @ptrCast([*]const u8, &ubo), uniform_buffer_total_len);
-
+                @memcpy(uniform_buffer_mapped_memory[uniform_buffer_segment_len * current_frame ..].ptr, @ptrCast([*]const u8, &ubo), uniform_buffer_segment_len);
                 break :update_uniform_buffer;
             }
 
