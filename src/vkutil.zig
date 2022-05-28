@@ -128,7 +128,7 @@ const allocation_wrapper = struct {
         const old_metadata = std.mem.bytesToValue(Metadata, old_ptr[0..@sizeOf(Metadata)]);
 
         const old_bytes = old_ptr[0..old_metadata.len];
-        const new_bytes = allocator.reallocBytes(old_bytes, old_metadata.alignment, size, @intCast(u29, alignment), 0, @returnAddress()) catch return null;
+        const new_bytes = allocator.reallocBytes(old_bytes, old_metadata.alignment, @sizeOf(Metadata) + size, @intCast(u29, alignment), 0, @returnAddress()) catch return null;
 
         std.mem.bytesAsValue(Metadata, new_bytes[0..@sizeOf(Metadata)]).* = .{
             .len = new_bytes.len,
