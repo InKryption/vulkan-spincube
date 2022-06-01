@@ -369,6 +369,24 @@ const DeviceDispatch = vk.DeviceWrapper(vk.DeviceCommandFlags{
     .destroySwapchainKHR = true,
     .getSwapchainImagesKHR = true,
 
+    .getImageMemoryRequirements = true,
+    .getBufferMemoryRequirements = true,
+
+    .allocateMemory = true,
+    .freeMemory = true,
+
+    .mapMemory = true,
+    .unmapMemory = true,
+
+    .bindBufferMemory = true,
+    .bindImageMemory = true,
+
+    .createBuffer = true,
+    .destroyBuffer = true,
+
+    .createImage = true,
+    .destroyImage = true,
+
     .createImageView = true,
     .destroyImageView = true,
 
@@ -433,17 +451,6 @@ const DeviceDispatch = vk.DeviceWrapper(vk.DeviceCommandFlags{
     .cmdDrawIndexed = true,
 
     .acquireNextImageKHR = true,
-
-    .createBuffer = true,
-    .destroyBuffer = true,
-    .getBufferMemoryRequirements = true,
-    .bindBufferMemory = true,
-
-    .allocateMemory = true,
-    .freeMemory = true,
-
-    .mapMemory = true,
-    .unmapMemory = true,
 });
 
 fn getInstanceProcAddress(handle: vk.Instance, name: [*:0]const u8) ?*const anyopaque {
@@ -640,9 +647,6 @@ pub fn main() !void {
         for (user_configured_data.desired_vulkan_layers) |name| allocator.free(name);
         allocator.free(user_configured_data.desired_vulkan_layers);
     }
-
-    const texture_data: stb_img.Image = stb_img.loadFromMemory(@embedFile("../res/texture.jpg"), .rgb_alpha) orelse return error.FailedToLoadImageFromMemory;
-    defer stb_img.imageFree(texture_data.bytes);
 
     const indices_data: []const u16 = &[_]u16{
         0, 1, 2,
@@ -1511,6 +1515,47 @@ pub fn main() !void {
 
         break :init_ubo_buff_and_descriptor_sets;
     }
+
+    const texture_data: stb_img.Image = stb_img.loadFromMemory(@embedFile("../res/texture.jpg"), .rgb_alpha) orelse return error.FailedToLoadImageFromMemory;
+    defer stb_img.imageFree(texture_data.bytes);
+
+    const texture_image: vk.Image = try device.dsp.createImage(device.handle, &vk.ImageCreateInfo{
+        .flags = .{},
+        .image_type = .@"2d",
+        .format = .r8g8b8a8_srgb,
+        .extent = vk.Extent3D{
+            .width = @intCast(u32, texture_data.x),
+            .height = @intCast(u32, texture_data.y),
+            .depth = 1,
+        },
+        .mip_levels = 1,
+        .array_layers = 1,
+        .samples = vk.SampleCountFlags{ .@"1_bit" = true },
+        .tiling = .optimal,
+        .usage = vk.ImageUsageFlags{
+            .transfer_dst_bit = true,
+            .sampled_bit = true,
+        },
+
+        .sharing_mode = .exclusive,
+
+        .queue_family_index_count = 0,
+        .p_queue_family_indices = emptySlice(u32).ptr,
+
+        .initial_layout = .@"undefined",
+    }, &vkutil.allocCallbacksFrom(&allocator));
+    defer device.dsp.destroyImage(device.handle, texture_image, &vkutil.allocCallbacksFrom(&allocator));
+
+    const texture_memory: vk.DeviceMemory = texture_memory: {
+        const requirements = device.dsp.getImageMemoryRequirements(device.handle, texture_image);
+        break :texture_memory try vkutil.allocateMemory(allocator, device.dsp, device.handle, vk.MemoryAllocateInfo{
+            .allocation_size = requirements.size,
+            .memory_type_index = selectMemoryType(physdev_mem_properties, requirements, vk.MemoryPropertyFlags{ .device_local_bit = true }) orelse return error.NoSuitableMemoryTypes,
+        });
+    };
+    defer vkutil.freeMemory(allocator, device.dsp, device.handle, texture_memory);
+
+    try device.dsp.bindImageMemory(device.handle, texture_image, texture_memory, 0);
 
     const vertices_buffer_len: usize = vertices_data.len * @sizeOf(Vertex);
     const vertices_buffer: vk.Buffer = try vkutil.createBuffer(allocator, device.dsp, device.handle, vkutil.BufferCreateInfo{
