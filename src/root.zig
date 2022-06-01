@@ -5,9 +5,9 @@ const vk = @import("vulkan");
 const vkutil = @import("vkutil.zig");
 const argsparse = @import("MasterQ32/zig-args");
 const zlm = @import("ziglibs/zlm");
+const shader_bytecode = @import("shaders/index.zig");
 
 const build_options = @import("build_options");
-const shader_bytecode_paths = @import("shader-bytecode-paths");
 const Result = @import("result.zig").Result;
 
 const VulkanInstance = struct {
@@ -1111,20 +1111,17 @@ pub fn main() !void {
     const graphics_pipeline: vk.Pipeline = graphics_pipeline: {
         const vk_allocator: ?*const vk.AllocationCallbacks = &vkutil.allocCallbacksFrom(&allocator);
 
-        const vert_bytecode = @embedFile(shader_bytecode_paths.vert);
-        const frag_bytecode = @embedFile(shader_bytecode_paths.frag);
-
         const vert_shader_module: vk.ShaderModule = try device.dsp.createShaderModule(device.handle, &vk.ShaderModuleCreateInfo{
             .flags = .{},
-            .code_size = vert_bytecode.len,
-            .p_code = @ptrCast([*]const u32, vert_bytecode),
+            .code_size = shader_bytecode.vert.len,
+            .p_code = @ptrCast([*]const u32, shader_bytecode.vert),
         }, vk_allocator);
         defer device.dsp.destroyShaderModule(device.handle, vert_shader_module, vk_allocator);
 
         const frag_shader_module: vk.ShaderModule = try device.dsp.createShaderModule(device.handle, &vk.ShaderModuleCreateInfo{
             .flags = .{},
-            .code_size = frag_bytecode.len,
-            .p_code = @ptrCast([*]const u32, frag_bytecode),
+            .code_size = shader_bytecode.frag.len,
+            .p_code = @ptrCast([*]const u32, shader_bytecode.frag),
         }, vk_allocator);
         defer device.dsp.destroyShaderModule(device.handle, frag_shader_module, vk_allocator);
 

@@ -44,8 +44,8 @@ pub fn build(b: *std.build.Builder) void {
     {
         const shader_byte_code_paths = b.addOptions();
         exe.addOptions("shader-bytecode-paths", shader_byte_code_paths);
-        shader_byte_code_paths.addOptionFileSource("vert", .{ .path = vk_shader_compile_step.add("src/shader.vert") });
-        shader_byte_code_paths.addOptionFileSource("frag", .{ .path = vk_shader_compile_step.add("src/shader.frag") });
+        shader_byte_code_paths.addOptionFileSource("vert", .{ .path = vk_shader_compile_step.add("src/shaders/shader.vert") });
+        shader_byte_code_paths.addOptionFileSource("frag", .{ .path = vk_shader_compile_step.add("src/shaders/shader.frag") });
     }
 
     const run_cmd = exe.run();
