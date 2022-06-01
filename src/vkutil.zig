@@ -3,26 +3,26 @@ const vk = @import("vulkan");
 
 const vkutil = @This();
 
-pub inline fn isBaseWrapper(comptime T: type) bool {
+pub fn isBaseWrapper(comptime T: type) bool {
     if (@typeInfo(T) != .Struct) return false;
     if (!@hasDecl(T, "commands")) return false;
     if (!std.meta.declarationInfo(T, "commands").is_pub) return false;
     return T == vk.BaseWrapper(T.commands);
 }
-pub inline fn isInstanceWrapper(comptime T: type) bool {
+pub fn isInstanceWrapper(comptime T: type) bool {
     if (@typeInfo(T) != .Struct) return false;
     if (!@hasDecl(T, "commands")) return false;
     if (!std.meta.declarationInfo(T, "commands").is_pub) return false;
     return T == vk.InstanceWrapper(T.commands);
 }
-pub inline fn isDeviceWrapper(comptime T: type) bool {
+pub fn isDeviceWrapper(comptime T: type) bool {
     if (@typeInfo(T) != .Struct) return false;
     if (!@hasDecl(T, "commands")) return false;
     if (!std.meta.declarationInfo(T, "commands").is_pub) return false;
     return T == vk.DeviceWrapper(T.commands);
 }
 
-pub inline fn fmtApiVersion(version_bits: u32) std.fmt.Formatter(formatApiVersion) {
+pub fn fmtApiVersion(version_bits: u32) std.fmt.Formatter(formatApiVersion) {
     return .{ .data = version_bits };
 }
 fn formatApiVersion(
@@ -45,7 +45,7 @@ fn formatApiVersion(
     try writer.print("{d}.{d}.{d}", .{ major, minor, patch });
 }
 
-pub inline fn loggingDebugMessengerCallback(
+pub fn loggingDebugMessengerCallback(
     msg_severity_int: vk.DebugUtilsMessageSeverityFlagsEXT.IntType,
     message_types: vk.DebugUtilsMessageTypeFlagsEXT.IntType,
     opt_p_callback_data: ?*const vk.DebugUtilsMessengerCallbackDataEXT,
@@ -895,5 +895,30 @@ pub inline fn cmdBindVertexBuffers(
         @intCast(u32, buffers.len),
         buffers.ptr,
         offsets.ptr,
+    );
+}
+
+pub inline fn cmdPipelineBarrier(
+    device_dsp: anytype,
+    command_buffer: vk.CommandBuffer,
+    src_stage_mask: vk.PipelineStageFlags,
+    dst_stage_mask: vk.PipelineStageFlags,
+    dependency_flags: vk.DependencyFlags,
+    memory_barriers: []const vk.MemoryBarrier,
+    buffer_memory_barriers: []const vk.BufferMemoryBarrier,
+    image_memory_barriers: []const vk.ImageMemoryBarrier,
+) void {
+    comptime std.debug.assert(isDeviceWrapper(@TypeOf(device_dsp)));
+    return device_dsp.cmdPipelineBarrier(
+        command_buffer,
+        src_stage_mask,
+        dst_stage_mask,
+        dependency_flags,
+        @intCast(u32, memory_barriers.len),
+        memory_barriers.ptr,
+        @intCast(u32, buffer_memory_barriers.len),
+        buffer_memory_barriers.ptr,
+        @intCast(u32, image_memory_barriers.len),
+        image_memory_barriers.ptr,
     );
 }

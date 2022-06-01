@@ -1,11 +1,14 @@
-comptime {
-    const std = @import("std");
-    const root = @import("root");
+const std = @import("std");
+const root = @import("root");
 
-    const stb_allocator: *const std.mem.Allocator = if (@hasDecl(root, "stb_allocator"))
-        &root.stb_allocator
-    else
-        &std.heap.c_allocator;
+var stb_allocator: std.mem.Allocator = std.heap.c_allocator;
+
+pub fn setAllocator(user_allocator: std.mem.Allocator) void {
+    @setCold(true);
+    stb_allocator = user_allocator;
+}
+
+comptime {
     const gen = struct {
         const Metadata = struct { len: usize };
         fn userMalloc(size: usize) callconv(.C) ?*anyopaque {
@@ -120,8 +123,37 @@ pub fn imageFree(retval_from_stbi_load: *anyopaque) void {
     return stbi_image_free(retval_from_stbi_load);
 }
 
+pub const Info = struct {
+    x: c_int,
+    y: c_int,
+    channels: c_int,
+};
 pub extern fn stbi_info_from_memory(buffer: [*]const u8, len: c_int, x: ?*c_int, y: ?*c_int, comp: ?*c_int) c_int;
+pub fn infoFromMemory(buffer: []const u8) error{ImageTypeUnknownOrCorrupt}!Info {
+    var result: Info = undefined;
+    const exit = stbi_info_from_memory(
+        buffer.ptr,
+        @intCast(c_int, buffer.len),
+        &result.x,
+        &result.y,
+        &result.channels,
+    );
+    return if (exit != 0) result else error.ImageTypeUnknownOrCorrupt;
+}
+
 pub extern fn stbi_info_from_callbacks(clbk: *const IoCallbacks, user: ?*anyopaque, x: ?*c_int, y: ?*c_int, comp: ?*c_int) c_int;
+pub fn infoFromCallbacks(clbk: IoCallbacks, user: ?*anyopaque) error{ImageTypeUnknownOrCorrupt}!Info {
+    var result: Info = undefined;
+    const exit = stbi_info_from_callbacks(
+        &clbk,
+        user,
+        &result.x,
+        &result.y,
+        &result.comp,
+    );
+    return if (exit != 0) result else error.ImageTypeUnknownOrCorrupt;
+}
+
 pub extern fn stbi_is_16_bit_from_memory(buffer: [*]const u8, len: c_int) c_int;
 pub extern fn stbi_is_16_bit_from_callbacks(clbk: *const IoCallbacks, user: ?*anyopaque) c_int;
 pub extern fn stbi_set_unpremultiply_on_load(flag_true_if_should_unpremultiply: c_int) void;

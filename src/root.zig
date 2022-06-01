@@ -18,6 +18,24 @@ const VulkanInstance = struct {
 const VulkanDevice = struct {
     handle: vk.Device,
     dsp: DeviceDispatch,
+
+    pub inline fn createBuffer(self: VulkanDevice, allocator: std.mem.Allocator, create_info: vkutil.BufferCreateInfo) DeviceDispatch.CreateBufferError!vk.Buffer {
+        return vkutil.createBuffer(allocator, self.dsp, self.handle, create_info);
+    }
+    pub inline fn destroyBuffer(self: VulkanDevice, allocator: std.mem.Allocator, buffer: vk.Buffer) void {
+        return vkutil.destroyBuffer(allocator, self.dsp, self.handle, buffer);
+    }
+
+    pub inline fn allocateMemory(self: VulkanDevice, allocator: std.mem.Allocator, allocate_info: vk.MemoryAllocateInfo) DeviceDispatch.AllocateMemoryError!vk.DeviceMemory {
+        return vkutil.allocateMemory(allocator, self.dsp, self.handle, allocate_info);
+    }
+    pub inline fn freeMemory(self: VulkanDevice, allocator: std.mem.Allocator, memory: vk.DeviceMemory) void {
+        return vkutil.freeMemory(allocator, self.dsp, self.handle, memory);
+    }
+
+    pub inline fn bindBufferMemory(self: VulkanDevice, buffer: vk.Buffer, memory: vk.DeviceMemory, memory_offset: vk.DeviceSize) DeviceDispatch.BindBufferMemoryError!void {
+        return self.dsp.bindBufferMemory(self.handle, buffer, memory, memory_offset);
+    }
 };
 const CoreQueueFamilyIndices = struct {
     graphics: u32,
@@ -441,6 +459,8 @@ const DeviceDispatch = vk.DeviceWrapper(vk.DeviceCommandFlags{
     .cmdSetViewport = true,
     .cmdSetScissor = true,
     .cmdCopyBuffer = true,
+    .cmdCopyBufferToImage = true,
+    .cmdPipelineBarrier = true,
     .cmdBeginRenderPass = true,
     .cmdEndRenderPass = true,
     .cmdBindPipeline = true,
@@ -517,10 +537,94 @@ fn selectMemoryType(
     }
     return good_enough;
 }
-// Allocator for stb_image to use.
-pub usingnamespace struct {
-    pub var stb_allocator: std.mem.Allocator = std.heap.c_allocator;
-};
+
+fn allocateOneCommandBuffer(
+    device_dsp: anytype,
+    device: vk.Device,
+    command_pool: vk.CommandPool,
+    level: vk.CommandBufferLevel,
+) @TypeOf(device_dsp).AllocateCommandBuffersError!vk.CommandBuffer {
+    comptime std.debug.assert(vkutil.isDeviceWrapper(@TypeOf(device_dsp)));
+
+    var result: vk.CommandBuffer = .null_handle;
+    try device_dsp.allocateCommandBuffers(device, &vk.CommandBufferAllocateInfo{
+        .command_pool = command_pool,
+        .level = level,
+        .command_buffer_count = 1,
+    }, @ptrCast(*[1]vk.CommandBuffer, &result));
+
+    return result;
+}
+
+/// Returns an empty slice of `T`.
+fn emptySlice(comptime T: type) []T {
+    return &.{};
+}
+
+fn recordImageLayoutTransition(
+    device_dsp: anytype,
+    cmdbuffer: vk.CommandBuffer,
+    image: vk.Image,
+    old_layout: vk.ImageLayout,
+    new_layout: vk.ImageLayout,
+    subresource_range: vk.ImageSubresourceRange,
+) void {
+    var src_stage_mask: vk.PipelineStageFlags = undefined;
+    var dst_stage_mask: vk.PipelineStageFlags = undefined;
+
+    var src_access_mask: vk.AccessFlags = undefined;
+    var dst_access_mask: vk.AccessFlags = undefined;
+
+    const helper = struct {
+        fn invalidTransitionPanic() noreturn {
+            @panic("Whoops, invalid image layout transition!\n");
+        }
+    };
+    switch (old_layout) {
+        .@"undefined" => switch (new_layout) {
+            .transfer_dst_optimal => {
+                src_access_mask = .{};
+                dst_access_mask = .{ .transfer_write_bit = true };
+
+                src_stage_mask = .{ .top_of_pipe_bit = true };
+                dst_stage_mask = .{ .transfer_bit = true };
+            },
+            else => helper.invalidTransitionPanic(),
+        },
+        .transfer_dst_optimal => switch (new_layout) {
+            .shader_read_only_optimal => {
+                src_access_mask = .{ .transfer_write_bit = true };
+                dst_access_mask = .{ .shader_read_bit = true };
+
+                src_stage_mask = .{ .transfer_bit = true };
+                dst_stage_mask = .{ .fragment_shader_bit = true };
+            },
+            else => helper.invalidTransitionPanic(),
+        },
+        else => helper.invalidTransitionPanic(),
+    }
+
+    vkutil.cmdPipelineBarrier(
+        device_dsp,
+        cmdbuffer,
+        src_stage_mask,
+        dst_stage_mask,
+        vk.DependencyFlags{},
+        &[_]vk.MemoryBarrier{},
+        &[_]vk.BufferMemoryBarrier{},
+        &[_]vk.ImageMemoryBarrier{.{
+            .src_access_mask = src_access_mask,
+            .dst_access_mask = dst_access_mask,
+
+            .old_layout = .@"undefined",
+            .new_layout = .transfer_dst_optimal,
+            .src_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
+            .dst_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
+            .image = image,
+            .subresource_range = subresource_range,
+        }},
+    );
+}
 
 pub fn main() !void {
     try file_logger.init("vulkan-spincube.log", .{ .stderr_level = .warn });
@@ -535,7 +639,7 @@ pub fn main() !void {
     defer _ = gpa.deinit();
 
     const allocator: std.mem.Allocator = gpa.allocator();
-    @This().stb_allocator = allocator;
+    stb_img.setAllocator(allocator);
 
     try glfw.init(.{});
     defer glfw.terminate();
@@ -952,14 +1056,14 @@ pub fn main() !void {
                 .flags = .{},
                 .queue_family_index = core_qfi.graphics,
                 .queue_count = 1,
-                .p_queue_priorities = std.mem.span(&[_]f32{1.0}).ptr,
+                .p_queue_priorities = &[_]f32{1.0},
             });
             if (core_qfi.graphics != core_qfi.present) {
                 try queue_create_infos.append(.{
                     .flags = .{},
                     .queue_family_index = core_qfi.present,
                     .queue_count = 1,
-                    .p_queue_priorities = std.mem.span(&[_]f32{1.0}).ptr,
+                    .p_queue_priorities = &[_]f32{1.0},
                 });
             }
 
@@ -1062,12 +1166,12 @@ pub fn main() !void {
             },
         };
 
-        const input_attachment_refs = [_]vk.AttachmentReference{};
-        const color_attachment_refs = [_]vk.AttachmentReference{.{
+        const input_attachment_refs: []const vk.AttachmentReference = &.{};
+        const color_attachment_refs: []const vk.AttachmentReference = &[_]vk.AttachmentReference{.{
             .attachment = 0,
             .layout = .color_attachment_optimal,
         }};
-        const preserve_attachment_refs = [_]u32{};
+        const preserve_attachment_refs: []const u32 = &.{};
 
         const subpasses = [_]vk.SubpassDescription{
             .{
@@ -1075,19 +1179,19 @@ pub fn main() !void {
                 .pipeline_bind_point = .graphics,
                 //
                 .input_attachment_count = @intCast(u32, input_attachment_refs.len),
-                .p_input_attachments = std.mem.span(&input_attachment_refs).ptr,
+                .p_input_attachments = input_attachment_refs.ptr,
                 //
                 .color_attachment_count = @intCast(u32, color_attachment_refs.len),
-                .p_color_attachments = &color_attachment_refs,
+                .p_color_attachments = color_attachment_refs.ptr,
                 //
                 .p_resolve_attachments = null,
                 .p_depth_stencil_attachment = null,
                 //
                 .preserve_attachment_count = @intCast(u32, preserve_attachment_refs.len),
-                .p_preserve_attachments = std.mem.span(&preserve_attachment_refs).ptr,
+                .p_preserve_attachments = preserve_attachment_refs.ptr,
             },
         };
-        const subpass_dependencies = [_]vk.SubpassDependency{
+        const subpass_dependencies: []const vk.SubpassDependency = &[_]vk.SubpassDependency{
             .{ // image acquisition subpass dependency
                 .src_subpass = vk.SUBPASS_EXTERNAL,
                 .dst_subpass = 0,
@@ -1114,7 +1218,7 @@ pub fn main() !void {
                 .p_subpasses = &subpasses,
 
                 .dependency_count = @intCast(u32, subpass_dependencies.len),
-                .p_dependencies = std.mem.span(&subpass_dependencies).ptr,
+                .p_dependencies = subpass_dependencies.ptr,
             },
             &vkutil.allocCallbacksFrom(&allocator),
         );
@@ -1224,7 +1328,7 @@ pub fn main() !void {
             .blend_constants = [1]f32{0.0} ** 4,
         };
 
-        const dynamic_states = [_]vk.DynamicState{
+        const dynamic_states: []const vk.DynamicState = &[_]vk.DynamicState{
             .viewport,
             .scissor,
         };
@@ -1273,7 +1377,7 @@ pub fn main() !void {
             .p_dynamic_state = &vk.PipelineDynamicStateCreateInfo{
                 .flags = .{},
                 .dynamic_state_count = @intCast(u32, dynamic_states.len),
-                .p_dynamic_states = std.mem.span(&dynamic_states).ptr,
+                .p_dynamic_states = dynamic_states.ptr,
             },
 
             .layout = graphics_pipeline_layout,
@@ -1461,7 +1565,7 @@ pub fn main() !void {
 
     const uniform_buffer_segment_len: usize = @sizeOf(UniformBufferObject);
     const uniform_buffer_total_len: usize = uniform_buffer_segment_len * max_frames_in_flight;
-    const uniform_buffer: vk.Buffer = try vkutil.createBuffer(allocator, device.dsp, device.handle, vkutil.BufferCreateInfo{
+    const uniform_buffer: vk.Buffer = try device.createBuffer(allocator, vkutil.BufferCreateInfo{
         .size = uniform_buffer_total_len,
         .usage = vk.BufferUsageFlags{
             .uniform_buffer_bit = true,
@@ -1469,11 +1573,11 @@ pub fn main() !void {
         .sharing_mode = .exclusive,
         .queue_family_indices = &.{},
     });
-    defer vkutil.destroyBuffer(allocator, device.dsp, device.handle, uniform_buffer);
+    defer device.destroyBuffer(allocator, uniform_buffer);
 
     const uniform_buffers_mem: vk.DeviceMemory = uniform_buffers_mem: {
         const requirements: vk.MemoryRequirements = device.dsp.getBufferMemoryRequirements(device.handle, uniform_buffer);
-        break :uniform_buffers_mem try vkutil.allocateMemory(allocator, device.dsp, device.handle, vk.MemoryAllocateInfo{
+        break :uniform_buffers_mem try device.allocateMemory(allocator, vk.MemoryAllocateInfo{
             .allocation_size = requirements.size,
             .memory_type_index = selectMemoryType(
                 physdev_mem_properties,
@@ -1485,11 +1589,11 @@ pub fn main() !void {
             ) orelse return error.NoSuitableMemoryTypesOnSelectedPhysicalDevice,
         });
     };
-    defer vkutil.freeMemory(allocator, device.dsp, device.handle, uniform_buffers_mem);
+    defer device.freeMemory(allocator, uniform_buffers_mem);
+
+    try device.bindBufferMemory(uniform_buffer, uniform_buffers_mem, 0);
 
     init_ubo_buff_and_descriptor_sets: {
-        try device.dsp.bindBufferMemory(device.handle, uniform_buffer, uniform_buffers_mem, 0);
-
         const descriptor_sets: []const vk.DescriptorSet = syncronized_frames.items(.descriptor_set);
 
         {
@@ -1516,18 +1620,19 @@ pub fn main() !void {
         break :init_ubo_buff_and_descriptor_sets;
     }
 
-    const texture_data: stb_img.Image = stb_img.loadFromMemory(@embedFile("../res/texture.jpg"), .rgb_alpha) orelse return error.FailedToLoadImageFromMemory;
-    defer stb_img.imageFree(texture_data.bytes);
+    const texture_embed = @embedFile("../res/texture.jpg");
+    const texture_info = try stb_img.infoFromMemory(texture_embed);
 
+    const texture_extent = vk.Extent3D{
+        .width = @intCast(u32, texture_info.x),
+        .height = @intCast(u32, texture_info.y),
+        .depth = 1,
+    };
     const texture_image: vk.Image = try device.dsp.createImage(device.handle, &vk.ImageCreateInfo{
         .flags = .{},
         .image_type = .@"2d",
         .format = .r8g8b8a8_srgb,
-        .extent = vk.Extent3D{
-            .width = @intCast(u32, texture_data.x),
-            .height = @intCast(u32, texture_data.y),
-            .depth = 1,
-        },
+        .extent = texture_extent,
         .mip_levels = 1,
         .array_layers = 1,
         .samples = vk.SampleCountFlags{ .@"1_bit" = true },
@@ -1548,17 +1653,137 @@ pub fn main() !void {
 
     const texture_memory: vk.DeviceMemory = texture_memory: {
         const requirements = device.dsp.getImageMemoryRequirements(device.handle, texture_image);
-        break :texture_memory try vkutil.allocateMemory(allocator, device.dsp, device.handle, vk.MemoryAllocateInfo{
+        break :texture_memory try device.allocateMemory(allocator, vk.MemoryAllocateInfo{
             .allocation_size = requirements.size,
-            .memory_type_index = selectMemoryType(physdev_mem_properties, requirements, vk.MemoryPropertyFlags{ .device_local_bit = true }) orelse return error.NoSuitableMemoryTypes,
+            .memory_type_index = selectMemoryType(physdev_mem_properties, requirements, vk.MemoryPropertyFlags{
+                .device_local_bit = true,
+            }) orelse return error.NoSuitableMemoryTypes,
         });
     };
-    defer vkutil.freeMemory(allocator, device.dsp, device.handle, texture_memory);
+    defer device.freeMemory(allocator, texture_memory);
 
     try device.dsp.bindImageMemory(device.handle, texture_image, texture_memory, 0);
 
+    init_texture_memory: {
+        const texture_data: stb_img.Image = stb_img.loadFromMemory(texture_embed, .rgb_alpha) orelse return error.FailedToLoadImageFromMemory;
+        defer stb_img.imageFree(texture_data.bytes);
+
+        const image_size = @intCast(vk.DeviceSize, texture_data.x) *
+            @intCast(vk.DeviceSize, texture_data.y) *
+            @intCast(vk.DeviceSize, texture_data.channels);
+        const staging_buffer: vk.Buffer = try device.createBuffer(allocator, vkutil.BufferCreateInfo{
+            .size = device.dsp.getImageMemoryRequirements(device.handle, texture_image).size,
+            .usage = vk.BufferUsageFlags{
+                .transfer_src_bit = true,
+            },
+            .sharing_mode = .exclusive,
+            .queue_family_indices = &.{},
+        });
+        defer device.destroyBuffer(allocator, staging_buffer);
+
+        const staging_buf_req = device.dsp.getBufferMemoryRequirements(device.handle, staging_buffer);
+        const staging_buffer_mem: vk.DeviceMemory = try device.allocateMemory(allocator, vk.MemoryAllocateInfo{
+            .allocation_size = staging_buf_req.size,
+            .memory_type_index = selectMemoryType(physdev_mem_properties, staging_buf_req, vk.MemoryPropertyFlags{
+                .host_visible_bit = true,
+                .host_coherent_bit = true,
+            }) orelse return error.NoSuitableMemoryTypes,
+        });
+        defer device.freeMemory(allocator, staging_buffer_mem);
+
+        try device.bindBufferMemory(staging_buffer, staging_buffer_mem, 0);
+
+        init_staging_buff_data: {
+            const mapped_memory = @ptrCast([*]u8, (try device.dsp.mapMemory(
+                device.handle,
+                staging_buffer_mem,
+                0,
+                image_size,
+                .{},
+            )).?);
+            defer device.dsp.unmapMemory(device.handle, staging_buffer_mem);
+
+            @memcpy(mapped_memory, texture_data.bytes, image_size);
+            break :init_staging_buff_data;
+        }
+
+        const copy_cmdbuffer = try allocateOneCommandBuffer(device.dsp, device.handle, copying_cmdpool, .primary);
+        defer device.dsp.freeCommandBuffers(device.handle, copying_cmdpool, 1, @ptrCast(*const [1]vk.CommandBuffer, &copy_cmdbuffer));
+
+        record_copy_cmdbuffer: {
+            try device.dsp.beginCommandBuffer(copy_cmdbuffer, &vk.CommandBufferBeginInfo{
+                .flags = vk.CommandBufferUsageFlags{ .one_time_submit_bit = true },
+                .p_inheritance_info = null,
+            });
+
+            recordImageLayoutTransition(
+                device.dsp,
+                copy_cmdbuffer,
+                texture_image,
+                .@"undefined",
+                .transfer_dst_optimal,
+                vk.ImageSubresourceRange{
+                    .aspect_mask = vk.ImageAspectFlags{ .color_bit = true },
+                    .base_mip_level = 0,
+                    .level_count = 1,
+                    .base_array_layer = 0,
+                    .layer_count = 1,
+                },
+            );
+
+            device.dsp.cmdCopyBufferToImage(copy_cmdbuffer, staging_buffer, texture_image, .transfer_dst_optimal, 1, &[_]vk.BufferImageCopy{.{
+                .buffer_offset = 0,
+                .buffer_row_length = 0,
+                .buffer_image_height = 0,
+
+                .image_subresource = vk.ImageSubresourceLayers{
+                    .aspect_mask = vk.ImageAspectFlags{ .color_bit = true },
+                    .mip_level = 0,
+                    .base_array_layer = 0,
+                    .layer_count = 1,
+                },
+
+                .image_offset = vk.Offset3D{ .x = 0, .y = 0, .z = 0 },
+                .image_extent = texture_extent,
+            }});
+
+            recordImageLayoutTransition(
+                device.dsp,
+                copy_cmdbuffer,
+                texture_image,
+                .transfer_dst_optimal,
+                .shader_read_only_optimal,
+                vk.ImageSubresourceRange{
+                    .aspect_mask = vk.ImageAspectFlags{ .color_bit = true },
+                    .base_mip_level = 0,
+                    .level_count = 1,
+                    .base_array_layer = 0,
+                    .layer_count = 1,
+                },
+            );
+
+            try device.dsp.endCommandBuffer(copy_cmdbuffer);
+            break :record_copy_cmdbuffer;
+        }
+
+        try device.dsp.queueSubmit(device.dsp.getDeviceQueue(device.handle, core_qfi.graphics, 0), 1, &[_]vk.SubmitInfo{.{
+            .wait_semaphore_count = @intCast(u32, 0),
+            .p_wait_semaphores = emptySlice(vk.Semaphore).ptr,
+            .p_wait_dst_stage_mask = emptySlice(vk.PipelineStageFlags).ptr,
+
+            .command_buffer_count = 1,
+            .p_command_buffers = &[_]vk.CommandBuffer{copy_cmdbuffer},
+
+            .signal_semaphore_count = @intCast(u32, 0),
+            .p_signal_semaphores = emptySlice(vk.Semaphore).ptr,
+        }}, .null_handle);
+        try device.dsp.queueWaitIdle(device.dsp.getDeviceQueue(device.handle, core_qfi.graphics, 0));
+
+        break :init_texture_memory;
+    }
+
     const vertices_buffer_len: usize = vertices_data.len * @sizeOf(Vertex);
-    const vertices_buffer: vk.Buffer = try vkutil.createBuffer(allocator, device.dsp, device.handle, vkutil.BufferCreateInfo{
+    const vertices_buffer: vk.Buffer = try device.createBuffer(allocator, vkutil.BufferCreateInfo{
         .size = vertices_buffer_len,
         .usage = vk.BufferUsageFlags{
             .vertex_buffer_bit = true,
@@ -1567,10 +1792,10 @@ pub fn main() !void {
         .sharing_mode = .exclusive,
         .queue_family_indices = &.{},
     });
-    defer vkutil.destroyBuffer(allocator, device.dsp, device.handle, vertices_buffer);
+    defer device.destroyBuffer(allocator, vertices_buffer);
 
     const index_buffer_len: usize = indices_data.len * @sizeOf(u16);
-    const index_buffer: vk.Buffer = try vkutil.createBuffer(allocator, device.dsp, device.handle, vkutil.BufferCreateInfo{
+    const index_buffer: vk.Buffer = try device.createBuffer(allocator, vkutil.BufferCreateInfo{
         .size = index_buffer_len,
         .usage = vk.BufferUsageFlags{
             .index_buffer_bit = true,
@@ -1579,7 +1804,7 @@ pub fn main() !void {
         .sharing_mode = .exclusive,
         .queue_family_indices = &.{},
     });
-    defer vkutil.destroyBuffer(allocator, device.dsp, device.handle, index_buffer);
+    defer device.destroyBuffer(allocator, index_buffer);
 
     const vert_buff_mem_req = device.dsp.getBufferMemoryRequirements(device.handle, vertices_buffer);
     const indices_buff_mem_req = device.dsp.getBufferMemoryRequirements(device.handle, index_buffer);
@@ -1598,18 +1823,18 @@ pub fn main() !void {
             },
         ) orelse return error.NoSuitableMemoryTypesOnSelectedPhysicalDevice;
 
-        break :vertices_and_indices_mem try vkutil.allocateMemory(allocator, device.dsp, device.handle, vk.MemoryAllocateInfo{
+        break :vertices_and_indices_mem try device.allocateMemory(allocator, vk.MemoryAllocateInfo{
             .allocation_size = combined_requirements.size,
             .memory_type_index = memtype_index,
         });
     };
-    defer vkutil.freeMemory(allocator, device.dsp, device.handle, vertices_and_indices_mem);
+    defer device.freeMemory(allocator, vertices_and_indices_mem);
 
-    try device.dsp.bindBufferMemory(device.handle, vertices_buffer, vertices_and_indices_mem, 0);
-    try device.dsp.bindBufferMemory(device.handle, index_buffer, vertices_and_indices_mem, vert_buff_mem_req.size);
+    try device.bindBufferMemory(vertices_buffer, vertices_and_indices_mem, 0);
+    try device.bindBufferMemory(index_buffer, vertices_and_indices_mem, vert_buff_mem_req.size);
 
     init_vertices_and_indices_buffers: {
-        const staging_buffer: vk.Buffer = try vkutil.createBuffer(allocator, device.dsp, device.handle, vkutil.BufferCreateInfo{
+        const staging_buffer: vk.Buffer = try device.createBuffer(allocator, vkutil.BufferCreateInfo{
             .size = vertices_buffer_len + index_buffer_len,
             .usage = vk.BufferUsageFlags{
                 .vertex_buffer_bit = true,
@@ -1619,11 +1844,11 @@ pub fn main() !void {
             .sharing_mode = .exclusive,
             .queue_family_indices = &.{},
         });
-        defer vkutil.destroyBuffer(allocator, device.dsp, device.handle, staging_buffer);
+        defer device.destroyBuffer(allocator, staging_buffer);
 
         const staging_buff_mem_req = device.dsp.getBufferMemoryRequirements(device.handle, staging_buffer);
 
-        const staging_buff_mem: vk.DeviceMemory = try vkutil.allocateMemory(allocator, device.dsp, device.handle, vk.MemoryAllocateInfo{
+        const staging_buff_mem: vk.DeviceMemory = try device.allocateMemory(allocator, vk.MemoryAllocateInfo{
             .allocation_size = staging_buff_mem_req.size,
             .memory_type_index = selectMemoryType(
                 physdev_mem_properties,
@@ -1634,9 +1859,10 @@ pub fn main() !void {
                 },
             ) orelse return error.NoSuitableMemoryTypesOnSelectedPhysicalDevice,
         });
-        defer vkutil.freeMemory(allocator, device.dsp, device.handle, staging_buff_mem);
+        defer device.freeMemory(allocator, staging_buff_mem);
 
-        try device.dsp.bindBufferMemory(device.handle, staging_buffer, staging_buff_mem, 0);
+        try device.bindBufferMemory(staging_buffer, staging_buff_mem, 0);
+
         init_staging_buffer: {
             const mapped_memory = @ptrCast([*]u8, (try device.dsp.mapMemory(device.handle, staging_buff_mem, 0, staging_buff_mem_req.size, .{})).?);
             defer device.dsp.unmapMemory(device.handle, staging_buff_mem);
@@ -1655,12 +1881,7 @@ pub fn main() !void {
             break :init_staging_buffer;
         }
 
-        var copy_cmdbuffer: vk.CommandBuffer = .null_handle;
-        try device.dsp.allocateCommandBuffers(device.handle, &vk.CommandBufferAllocateInfo{
-            .command_pool = copying_cmdpool,
-            .level = .primary,
-            .command_buffer_count = 1,
-        }, @ptrCast(*[1]vk.CommandBuffer, &copy_cmdbuffer));
+        const copy_cmdbuffer = try allocateOneCommandBuffer(device.dsp, device.handle, copying_cmdpool, .primary);
         defer device.dsp.freeCommandBuffers(device.handle, copying_cmdpool, 1, @ptrCast(*const [1]vk.CommandBuffer, &copy_cmdbuffer));
 
         record_copy_cmdbuffer: {
@@ -1686,14 +1907,14 @@ pub fn main() !void {
 
         try device.dsp.queueSubmit(device.dsp.getDeviceQueue(device.handle, core_qfi.graphics, 0), 1, &[_]vk.SubmitInfo{.{
             .wait_semaphore_count = @intCast(u32, 0),
-            .p_wait_semaphores = std.mem.span(&[_]vk.Semaphore{}).ptr,
-            .p_wait_dst_stage_mask = std.mem.span(&[_]vk.PipelineStageFlags{}).ptr,
+            .p_wait_semaphores = emptySlice(vk.Semaphore).ptr,
+            .p_wait_dst_stage_mask = emptySlice(vk.PipelineStageFlags).ptr,
 
             .command_buffer_count = 1,
             .p_command_buffers = &[_]vk.CommandBuffer{copy_cmdbuffer},
 
             .signal_semaphore_count = @intCast(u32, 0),
-            .p_signal_semaphores = std.mem.span(&[_]vk.Semaphore{}).ptr,
+            .p_signal_semaphores = emptySlice(vk.Semaphore).ptr,
         }}, .null_handle);
         try device.dsp.queueWaitIdle(device.dsp.getDeviceQueue(device.handle, core_qfi.graphics, 0));
 
@@ -1918,9 +2139,4 @@ pub fn main() !void {
             break :draw_frame;
         }
     }
-}
-
-/// Returns an empty slice of `T`.
-fn emptySlice(comptime T: type) []T {
-    return &.{};
 }
