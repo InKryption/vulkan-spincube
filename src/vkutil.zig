@@ -3,26 +3,26 @@ const vk = @import("vulkan");
 
 const vkutil = @This();
 
-pub fn isBaseWrapper(comptime T: type) bool {
+pub inline fn isBaseWrapper(comptime T: type) bool {
     if (@typeInfo(T) != .Struct) return false;
     if (!@hasDecl(T, "commands")) return false;
     if (!std.meta.declarationInfo(T, "commands").is_pub) return false;
     return T == vk.BaseWrapper(T.commands);
 }
-pub fn isInstanceWrapper(comptime T: type) bool {
+pub inline fn isInstanceWrapper(comptime T: type) bool {
     if (@typeInfo(T) != .Struct) return false;
     if (!@hasDecl(T, "commands")) return false;
     if (!std.meta.declarationInfo(T, "commands").is_pub) return false;
     return T == vk.InstanceWrapper(T.commands);
 }
-pub fn isDeviceWrapper(comptime T: type) bool {
+pub inline fn isDeviceWrapper(comptime T: type) bool {
     if (@typeInfo(T) != .Struct) return false;
     if (!@hasDecl(T, "commands")) return false;
     if (!std.meta.declarationInfo(T, "commands").is_pub) return false;
     return T == vk.DeviceWrapper(T.commands);
 }
 
-pub fn fmtApiVersion(version_bits: u32) std.fmt.Formatter(formatApiVersion) {
+pub inline fn fmtApiVersion(version_bits: u32) std.fmt.Formatter(formatApiVersion) {
     return .{ .data = version_bits };
 }
 fn formatApiVersion(
@@ -45,7 +45,7 @@ fn formatApiVersion(
     try writer.print("{d}.{d}.{d}", .{ major, minor, patch });
 }
 
-pub fn loggingDebugMessengerCallback(
+pub inline fn loggingDebugMessengerCallback(
     msg_severity_int: vk.DebugUtilsMessageSeverityFlagsEXT.IntType,
     message_types: vk.DebugUtilsMessageTypeFlagsEXT.IntType,
     opt_p_callback_data: ?*const vk.DebugUtilsMessengerCallbackDataEXT,
@@ -178,7 +178,7 @@ pub const InstanceCreateInfo = struct {
         };
     };
 };
-pub fn createInstance(
+pub inline fn createInstance(
     allocator: std.mem.Allocator,
     base_dsp: anytype,
     instance_create_info: InstanceCreateInfo,
@@ -211,7 +211,7 @@ pub fn createInstance(
 
     return base_dsp.createInstance(&create_info, &vkutil.allocCallbacksFrom(&allocator));
 }
-pub fn enumerateInstanceLayerPropertiesAlloc(
+pub inline fn enumerateInstanceLayerPropertiesAlloc(
     allocator: std.mem.Allocator,
     base_dsp: anytype,
 ) (std.mem.Allocator.Error || @TypeOf(base_dsp).EnumerateInstanceLayerPropertiesError)![]vk.LayerProperties {
@@ -234,7 +234,7 @@ pub fn enumerateInstanceLayerPropertiesAlloc(
     std.debug.assert(layers.len == count);
     return layers;
 }
-pub fn enumerateInstanceExtensionPropertiesAlloc(
+pub inline fn enumerateInstanceExtensionPropertiesAlloc(
     allocator: std.mem.Allocator,
     base_dsp: anytype,
     layer_name: ?[:0]const u8,
@@ -260,7 +260,7 @@ pub fn enumerateInstanceExtensionPropertiesAlloc(
     std.debug.assert(extensions.len == count);
     return extensions;
 }
-pub fn enumerateInstanceExtensionPropertiesMultipleLayersAlloc(
+pub inline fn enumerateInstanceExtensionPropertiesMultipleLayersAlloc(
     allocator: std.mem.Allocator,
     base_dsp: anytype,
     include_base: bool,
@@ -305,7 +305,7 @@ pub fn enumerateInstanceExtensionPropertiesMultipleLayersAlloc(
     return extensions;
 }
 
-pub fn destroyInstance(
+pub inline fn destroyInstance(
     allocator: std.mem.Allocator,
     instance_dsp: anytype,
     instance: vk.Instance,
@@ -313,7 +313,7 @@ pub fn destroyInstance(
     comptime std.debug.assert(isInstanceWrapper(@TypeOf(instance_dsp)));
     instance_dsp.destroyInstance(instance, &vkutil.allocCallbacksFrom(&allocator));
 }
-pub fn getPhysicalDeviceSurfaceFormatsKHRAlloc(
+pub inline fn getPhysicalDeviceSurfaceFormatsKHRAlloc(
     allocator: std.mem.Allocator,
     instance_dsp: anytype,
     physical_device: vk.PhysicalDevice,
@@ -338,7 +338,7 @@ pub fn getPhysicalDeviceSurfaceFormatsKHRAlloc(
     std.debug.assert(formats.len == count);
     return formats;
 }
-pub fn getPhysicalDeviceSurfaceFormatsKHRArrayList(
+pub inline fn getPhysicalDeviceSurfaceFormatsKHRArrayList(
     arraylist: *std.ArrayList(vk.SurfaceFormatKHR),
     instance_dsp: anytype,
     physical_device: vk.PhysicalDevice,
@@ -362,7 +362,7 @@ pub fn getPhysicalDeviceSurfaceFormatsKHRArrayList(
     return arraylist.items;
 }
 
-pub fn getPhysicalDeviceSurfacePresentModesKHRAlloc(
+pub inline fn getPhysicalDeviceSurfacePresentModesKHRAlloc(
     allocator: std.mem.Allocator,
     instance_dsp: anytype,
     physical_device: vk.PhysicalDevice,
@@ -387,7 +387,7 @@ pub fn getPhysicalDeviceSurfacePresentModesKHRAlloc(
     std.debug.assert(present_modes.len == count);
     return present_modes;
 }
-pub fn getPhysicalDeviceSurfacePresentModesKHRArrayList(
+pub inline fn getPhysicalDeviceSurfacePresentModesKHRArrayList(
     arraylist: *std.ArrayList(vk.PresentModeKHR),
     instance_dsp: anytype,
     physical_device: vk.PhysicalDevice,
@@ -411,7 +411,7 @@ pub fn getPhysicalDeviceSurfacePresentModesKHRArrayList(
     return arraylist.items;
 }
 
-pub fn enumerateDeviceExtensionPropertiesAlloc(
+pub inline fn enumerateDeviceExtensionPropertiesAlloc(
     allocator: std.mem.Allocator,
     instance_dsp: anytype,
     physical_device: vk.PhysicalDevice,
@@ -435,7 +435,7 @@ pub fn enumerateDeviceExtensionPropertiesAlloc(
     std.debug.assert(extensions.len == count);
     return extensions;
 }
-pub fn getPhysicalDeviceQueueFamilyPropertiesAlloc(
+pub inline fn getPhysicalDeviceQueueFamilyPropertiesAlloc(
     allocator: std.mem.Allocator,
     instance_dsp: anytype,
     physical_device: vk.PhysicalDevice,
@@ -453,7 +453,7 @@ pub fn getPhysicalDeviceQueueFamilyPropertiesAlloc(
 
     return properties;
 }
-pub fn enumeratePhysicalDevicesAlloc(
+pub inline fn enumeratePhysicalDevicesAlloc(
     allocator: std.mem.Allocator,
     instance_dsp: anytype,
     instance: vk.Instance,
@@ -477,7 +477,7 @@ pub fn enumeratePhysicalDevicesAlloc(
     std.debug.assert(physical_devices.len == count);
     return physical_devices;
 }
-pub fn createDebugUtilsMessengerEXT(
+pub inline fn createDebugUtilsMessengerEXT(
     allocator: std.mem.Allocator,
     instance_dsp: anytype,
     instance: vk.Instance,
@@ -486,7 +486,7 @@ pub fn createDebugUtilsMessengerEXT(
     comptime std.debug.assert(isInstanceWrapper(@TypeOf(instance_dsp)));
     return instance_dsp.createDebugUtilsMessengerEXT(instance, &create_info, &vkutil.allocCallbacksFrom(&allocator));
 }
-pub fn destroyDebugUtilsMessengerEXT(
+pub inline fn destroyDebugUtilsMessengerEXT(
     allocator: std.mem.Allocator,
     instance_dsp: anytype,
     instance: vk.Instance,
@@ -503,7 +503,7 @@ pub const PhysicalDeviceMemoryProperties = struct {
     pub const MemoryTypes = std.BoundedArray(vk.MemoryType, vk.MAX_MEMORY_TYPES);
     pub const MemoryHeaps = std.BoundedArray(vk.MemoryHeap, vk.MAX_MEMORY_HEAPS);
 };
-pub fn getPhysicalDeviceMemoryProperties(
+pub inline fn getPhysicalDeviceMemoryProperties(
     instance_dsp: anytype,
     physical_device: vk.PhysicalDevice,
 ) vkutil.PhysicalDeviceMemoryProperties {
@@ -527,7 +527,7 @@ pub const DeviceCreateInfo = struct {
     enabled_extension_names: []const [*:0]const u8 = &.{},
     enabled_features: ?vk.PhysicalDeviceFeatures = null,
 };
-pub fn createDevice(
+pub inline fn createDevice(
     allocator: std.mem.Allocator,
     instance_dsp: anytype,
     physical_device: vk.PhysicalDevice,
@@ -554,7 +554,7 @@ pub fn createDevice(
         &vkutil.allocCallbacksFrom(&allocator),
     );
 }
-pub fn destroyDevice(
+pub inline fn destroyDevice(
     allocator: std.mem.Allocator,
     device_dsp: anytype,
     device: vk.Device,
@@ -586,7 +586,7 @@ pub const SwapchainCreateInfoKHR = struct {
 
     old_swapchain: vk.SwapchainKHR = .null_handle,
 };
-pub fn createSwapchainKHR(
+pub inline fn createSwapchainKHR(
     allocator: std.mem.Allocator,
     device_dsp: anytype,
     device: vk.Device,
@@ -618,7 +618,7 @@ pub fn createSwapchainKHR(
         .old_swapchain = create_info.old_swapchain,
     }, &vkutil.allocCallbacksFrom(&allocator));
 }
-pub fn destroySwapchainKHR(
+pub inline fn destroySwapchainKHR(
     allocator: std.mem.Allocator,
     device_dsp: anytype,
     device: vk.Device,
@@ -627,7 +627,7 @@ pub fn destroySwapchainKHR(
     comptime std.debug.assert(isDeviceWrapper(@TypeOf(device_dsp)));
     return device_dsp.destroySwapchainKHR(device, swapchain, &vkutil.allocCallbacksFrom(&allocator));
 }
-pub fn createImageView(
+pub inline fn createImageView(
     allocator: std.mem.Allocator,
     device_dsp: anytype,
     device: vk.Device,
@@ -636,7 +636,7 @@ pub fn createImageView(
     comptime std.debug.assert(isDeviceWrapper(@TypeOf(device_dsp)));
     return device_dsp.createImageView(device, &create_info, &vkutil.allocCallbacksFrom(&allocator));
 }
-pub fn destroyImageView(
+pub inline fn destroyImageView(
     allocator: std.mem.Allocator,
     device_dsp: anytype,
     device: vk.Device,
@@ -651,7 +651,7 @@ pub const DescriptorSetLayoutCreateInfo = struct {
     flags: vk.DescriptorSetLayoutCreateFlags = .{},
     bindings: []const vk.DescriptorSetLayoutBinding,
 };
-pub fn createDescriptorSetLayout(
+pub inline fn createDescriptorSetLayout(
     allocator: std.mem.Allocator,
     device_dsp: anytype,
     device: vk.Device,
@@ -669,7 +669,7 @@ pub fn createDescriptorSetLayout(
         &vkutil.allocCallbacksFrom(&allocator),
     );
 }
-pub fn destroyDescriptorSetLayout(
+pub inline fn destroyDescriptorSetLayout(
     allocator: std.mem.Allocator,
     device_dsp: anytype,
     device: vk.Device,
@@ -689,7 +689,7 @@ pub const PipelineLayoutCreateInfo = struct {
     set_layouts: []const vk.DescriptorSetLayout,
     push_constant_ranges: []const vk.PushConstantRange,
 };
-pub fn createPipelineLayout(
+pub inline fn createPipelineLayout(
     allocator: std.mem.Allocator,
     device_dsp: anytype,
     device: vk.Device,
@@ -707,7 +707,7 @@ pub fn createPipelineLayout(
         .p_push_constant_ranges = create_info.push_constant_ranges.ptr,
     }, &vkutil.allocCallbacksFrom(&allocator));
 }
-pub fn destroyPipelineLayout(
+pub inline fn destroyPipelineLayout(
     allocator: std.mem.Allocator,
     device_dsp: anytype,
     device: vk.Device,
@@ -727,7 +727,7 @@ pub const BufferCreateInfo = struct {
     sharing_mode: vk.SharingMode,
     queue_family_indices: []const u32,
 };
-pub fn createBuffer(
+pub inline fn createBuffer(
     allocator: std.mem.Allocator,
     device_dsp: anytype,
     device: vk.Device,
@@ -747,7 +747,7 @@ pub fn createBuffer(
         .p_queue_family_indices = create_info.queue_family_indices.ptr,
     }, &vkutil.allocCallbacksFrom(&allocator));
 }
-pub fn destroyBuffer(
+pub inline fn destroyBuffer(
     allocator: std.mem.Allocator,
     device_dsp: anytype,
     device: vk.Device,
@@ -757,7 +757,7 @@ pub fn destroyBuffer(
     return device_dsp.destroyBuffer(device, buffer, &vkutil.allocCallbacksFrom(&allocator));
 }
 
-pub fn allocateMemory(
+pub inline fn allocateMemory(
     allocator: std.mem.Allocator,
     device_dsp: anytype,
     device: vk.Device,
@@ -766,7 +766,7 @@ pub fn allocateMemory(
     comptime std.debug.assert(isDeviceWrapper(@TypeOf(device_dsp)));
     return device_dsp.allocateMemory(device, &allocate_info, &vkutil.allocCallbacksFrom(&allocator));
 }
-pub fn freeMemory(
+pub inline fn freeMemory(
     allocator: std.mem.Allocator,
     device_dsp: anytype,
     device: vk.Device,
@@ -782,7 +782,7 @@ pub const DescriptorPoolCreateInfo = struct {
     max_sets: u32,
     pool_sizes: []const vk.DescriptorPoolSize,
 };
-pub fn createDescriptorPool(
+pub inline fn createDescriptorPool(
     allocator: std.mem.Allocator,
     device_dsp: anytype,
     device: vk.Device,
@@ -797,7 +797,7 @@ pub fn createDescriptorPool(
         .p_pool_sizes = create_info.pool_sizes.ptr,
     }, &vkutil.allocCallbacksFrom(&allocator));
 }
-pub fn destroyDescriptorPool(
+pub inline fn destroyDescriptorPool(
     allocator: std.mem.Allocator,
     device_dsp: anytype,
     device: vk.Device,
@@ -812,7 +812,7 @@ pub const DescriptorSetAllocateInfo = struct {
     descriptor_pool: vk.DescriptorPool,
     set_layouts: []const vk.DescriptorSetLayout,
 };
-pub fn allocateDescriptorSets(
+pub inline fn allocateDescriptorSets(
     device_dsp: anytype,
     device: vk.Device,
     allocate_info: vkutil.DescriptorSetAllocateInfo,
@@ -829,7 +829,7 @@ pub fn allocateDescriptorSets(
         .p_set_layouts = allocate_info.set_layouts.ptr,
     }, descriptor_sets.ptr);
 }
-pub fn freeDescriptorSets(
+pub inline fn freeDescriptorSets(
     device_dsp: anytype,
     device: vk.Device,
     descriptor_pool: vk.DescriptorPool,
@@ -839,7 +839,7 @@ pub fn freeDescriptorSets(
     return device_dsp.freeDescriptorSets(device, descriptor_pool, @intCast(u32, descriptor_sets.len), descriptor_sets.ptr);
 }
 
-pub fn updateDescriptorSets(
+pub inline fn updateDescriptorSets(
     device_dsp: anytype,
     device: vk.Device,
     descriptor_writes: []const vk.WriteDescriptorSet,
@@ -862,7 +862,7 @@ pub const RenderPassBeginInfo = struct {
     render_area: vk.Rect2D,
     clear_values: []const vk.ClearValue,
 };
-pub fn cmdBeginRenderPass(
+pub inline fn cmdBeginRenderPass(
     device_dsp: anytype,
     command_buffer: vk.CommandBuffer,
     render_pass_begin: vkutil.RenderPassBeginInfo,
@@ -880,7 +880,7 @@ pub fn cmdBeginRenderPass(
 }
 
 /// asserts that `buffers.len == offsets.len`.
-pub fn cmdBindVertexBuffers(
+pub inline fn cmdBindVertexBuffers(
     device_dsp: anytype,
     command_buffer: vk.CommandBuffer,
     first_binding: u32,
