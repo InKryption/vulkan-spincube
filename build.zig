@@ -3,12 +3,12 @@ const vk = @import("dep/Snektron/vulkan-zig/generator/index.zig");
 const mach = @import("dep/hexops/mach/build.zig");
 
 pub fn build(b: *std.build.Builder) void {
-    const target = b.standardTargetOptions(.{});
     const mode = b.standardReleaseOptions();
+    const target = b.standardTargetOptions(.{});
 
     const exe = b.addExecutable("vulkan-spincube", "src/root.zig");
-    exe.setTarget(target);
     exe.setBuildMode(mode);
+    exe.setTarget(target);
     exe.install();
 
     const build_options = b.addOptions();
@@ -20,24 +20,34 @@ pub fn build(b: *std.build.Builder) void {
         .ReleaseFast, .ReleaseSmall => std.log.Level.err,
     });
 
-    const vk_gen_step = vk.VkGenerateStep.init(b, "dep/KhronosGroup/Vulkan-Docs/xml/vk.xml", "generated/vk.zig");
-    exe.step.dependOn(&vk_gen_step.step);
-    exe.addPackage(vk_gen_step.package);
+    stb_image_lib: {
+        exe.addPackagePath("stb_image", "stb_image/stb_image.zig");
+
+        const stbi_lib = b.addStaticLibrary("stbi", "stb_image/impl.c");
+        stbi_lib.setBuildMode(mode);
+        stbi_lib.setTarget(target);
+        stbi_lib.addIncludePath("stb_image");
+        stbi_lib.linkLibC();
+        exe.linkLibrary(stbi_lib);
+
+        const stbi_no_failure_strings = b.option(bool, "stbi-no-failure-strings", "stb_image macro option.") orelse false;
+        if (stbi_no_failure_strings) stbi_lib.defineCMacro("STBI_NO_FAILURE_STRINGS", null);
+
+        const stbi_failure_usermsg = b.option(bool, "stbi-failure-usermsg", "stb_image macro option.") orelse false;
+        if (stbi_failure_usermsg) stbi_lib.defineCMacro("STBI_FAILURE_USERMSG", "stbi_image macro option.");
+
+        break :stb_image_lib;
+    }
 
     mach.glfw.link(b, exe, mach.glfw.Options{ .vulkan = true });
     exe.addPackage(mach.glfw.pkg);
 
-    const @"zig-args" = std.build.Pkg{
-        .name = "MasterQ32/zig-args",
-        .source = .{ .path = "dep/MasterQ32/zig-args/args.zig" },
-    };
-    const zlm = std.build.Pkg{
-        .name = "ziglibs/zlm",
-        .source = .{ .path = "dep/ziglibs/zlm/zlm.zig" },
-    };
+    exe.addPackagePath("MasterQ32/zig-args", "dep/MasterQ32/zig-args/args.zig");
+    exe.addPackagePath("ziglibs/zlm", "dep/ziglibs/zlm/zlm.zig");
 
-    exe.addPackage(@"zig-args");
-    exe.addPackage(zlm);
+    const vk_gen_step = vk.VkGenerateStep.init(b, "dep/KhronosGroup/Vulkan-Docs/xml/vk.xml", "generated/vk.zig");
+    exe.step.dependOn(&vk_gen_step.step);
+    exe.addPackage(vk_gen_step.package);
 
     const vk_shader_compile_step = vk.ShaderCompileStep.init(b, &.{"glslc"}, "shader-bytecode");
     exe.step.dependOn(&vk_shader_compile_step.step);

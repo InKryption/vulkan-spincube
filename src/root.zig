@@ -6,6 +6,7 @@ const vkutil = @import("vkutil.zig");
 const argsparse = @import("MasterQ32/zig-args");
 const zlm = @import("ziglibs/zlm");
 const shader_bytecode = @import("shaders/index.zig");
+const stb_img = @import("stb_image");
 
 const build_options = @import("build_options");
 const Result = @import("result.zig").Result;
@@ -509,6 +510,10 @@ fn selectMemoryType(
     }
     return good_enough;
 }
+// Allocator for stb_image to use.
+pub usingnamespace struct {
+    pub var stb_allocator: std.mem.Allocator = std.heap.c_allocator;
+};
 
 pub fn main() !void {
     try file_logger.init("vulkan-spincube.log", .{ .stderr_level = .warn });
@@ -523,6 +528,7 @@ pub fn main() !void {
     defer _ = gpa.deinit();
 
     const allocator: std.mem.Allocator = gpa.allocator();
+    @This().stb_allocator = allocator;
 
     try glfw.init(.{});
     defer glfw.terminate();
@@ -634,6 +640,9 @@ pub fn main() !void {
         for (user_configured_data.desired_vulkan_layers) |name| allocator.free(name);
         allocator.free(user_configured_data.desired_vulkan_layers);
     }
+
+    const texture_data: stb_img.Image = stb_img.loadFromMemory(@embedFile("../res/texture.jpg"), .rgb_alpha) orelse return error.FailedToLoadImageFromMemory;
+    defer stb_img.imageFree(texture_data.bytes);
 
     const indices_data: []const u16 = &[_]u16{
         0, 1, 2,
