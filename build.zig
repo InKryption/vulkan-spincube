@@ -42,6 +42,7 @@ pub fn build(b: *std.build.Builder) void {
     mach.glfw.link(b, exe, mach.glfw.Options{ .vulkan = true });
     exe.addPackage(mach.glfw.pkg);
 
+    exe.addPackagePath("util", "util/util.zig");
     exe.addPackagePath("MasterQ32/zig-args", "dep/MasterQ32/zig-args/args.zig");
     exe.addPackagePath("ziglibs/zlm", "dep/ziglibs/zlm/zlm.zig");
 

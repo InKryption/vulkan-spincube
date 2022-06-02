@@ -8,8 +8,9 @@ const zlm = @import("ziglibs/zlm");
 const shader_bytecode = @import("shaders/index.zig");
 const stb_img = @import("stb_image");
 
+const util = @import("util");
+const resources = @import("res/index.zig");
 const build_options = @import("build_options");
-const Result = @import("result.zig").Result;
 
 const VulkanInstance = struct {
     handle: vk.Instance,
@@ -479,20 +480,6 @@ fn getInstanceProcAddress(handle: vk.Instance, name: [*:0]const u8) ?*const anyo
     return @ptrCast(*const anyopaque, result);
 }
 
-const file_logger = @import("file_logger.zig");
-pub const log = file_logger.log;
-pub const log_level: std.log.Level = std.enums.nameCast(std.log.Level, build_options.log_level);
-
-const max_frames_in_flight = 2;
-const supported_window_sizes: []const vk.Extent2D = &[_]vk.Extent2D{
-    .{ .width = 480, .height = 270 },
-    .{ .width = 960, .height = 540 },
-    .{ .width = 960, .height = 600 },
-    .{ .width = 1600, .height = 800 },
-    .{ .width = 1920, .height = 1080 },
-    .{ .width = 1920, .height = 1200 },
-};
-
 /// Returns an instance of `vk.MemoryRequirements` which would
 /// require a memory type and allocation size to accomodate both.
 fn combinedMemoryRequirements(a: vk.MemoryRequirements, b: vk.MemoryRequirements) vk.MemoryRequirements {
@@ -538,6 +525,11 @@ fn selectMemoryType(
     return good_enough;
 }
 
+const CreateExtensionSetConfig = struct {
+    StrType: type = [:0]const u8,
+    store_hash: bool = false,
+};
+
 fn allocateOneCommandBuffer(
     device_dsp: anytype,
     device: vk.Device,
@@ -554,11 +546,6 @@ fn allocateOneCommandBuffer(
     }, @ptrCast(*[1]vk.CommandBuffer, &result));
 
     return result;
-}
-
-/// Returns an empty slice of `T`.
-fn emptySlice(comptime T: type) []T {
-    return &.{};
 }
 
 fn recordImageLayoutTransition(
@@ -626,9 +613,24 @@ fn recordImageLayoutTransition(
     );
 }
 
+const max_frames_in_flight = 2;
+const supported_window_sizes: []const vk.Extent2D = &[_]vk.Extent2D{
+    .{ .width = 480, .height = 270 },
+    .{ .width = 960, .height = 540 },
+    .{ .width = 960, .height = 600 },
+    .{ .width = 1600, .height = 800 },
+    .{ .width = 1920, .height = 1080 },
+    .{ .width = 1920, .height = 1200 },
+};
+
+pub usingnamespace struct {
+    pub const log = util.file_logger.log;
+    pub const log_level: std.log.Level = std.enums.nameCast(std.log.Level, build_options.log_level);
+};
+
 pub fn main() !void {
-    try file_logger.init("vulkan-spincube.log", .{ .stderr_level = .warn });
-    defer file_logger.deinit();
+    try util.file_logger.init("vulkan-spincube.log", .{ .stderr_level = .warn });
+    defer util.file_logger.deinit();
 
     var gpa = std.heap.GeneralPurposeAllocator(.{
         .safety = true,
@@ -647,16 +649,17 @@ pub fn main() !void {
     const UserConfiguredData = struct {
         window_start_size_index: usize,
         desired_vulkan_layers: []const [:0]const u8,
-        list_layers_and_exit: bool,
+        list_instance_layers_and_exit: bool,
     };
-    const user_configured_data: UserConfiguredData = user_configured_data: {
+    const cmdline_data: UserConfiguredData = cmdline_data: {
         const CmdLineSpec = struct {
             /// whether to display the help text.
             help: bool = false,
-            /// window size.
+            /// specify window size.
             size: ?usize = null,
-            /// vulkan layers.
+            /// specify vulkan layers.
             @"vk-layers": []const u8 = &.{},
+            /// list vulkan layers.
             @"vk-list-layers": bool = false,
         };
         const CmdLineDescription = std.EnumArray(std.meta.FieldEnum(CmdLineSpec), []const u8);
@@ -683,13 +686,12 @@ pub fn main() !void {
 
         var local_arena_state = std.heap.ArenaAllocator.init(allocator);
         defer local_arena_state.deinit();
-
         const local_arena = local_arena_state.allocator();
 
         const cmdline_parse_result = try argsparse.parseForCurrentProcess(CmdLineSpec, local_arena, .silent);
         const cmdline_options: CmdLineSpec = cmdline_parse_result.options;
 
-        if (cmdline_options.help) {
+        if (cmdline_options.help) return {
             const stdout_writer = std.io.getStdOut().writer();
 
             try stdout_writer.writeAll("Command line options:\n");
@@ -697,15 +699,18 @@ pub fn main() !void {
                 const desc: []const u8 = cmdline_description.get(field);
                 try stdout_writer.writeAll(desc);
             }
-            return;
-        }
+        };
 
         const window_start_size_index: usize = window_start_size_index: {
             if (cmdline_options.size) |size| {
                 break :window_start_size_index size;
             }
-            const primary_monitor = glfw.Monitor.getPrimary() orelse return error.CouldNotGetPrimaryMonitorSize;
-            const work_area = try primary_monitor.getWorkarea();
+            const primary_monitor = glfw.Monitor.getPrimary() orelse return {
+                std.log.err("Failed to query primary monitor size; please specify a size using `--size=[index]`.", .{});
+            };
+            const work_area = primary_monitor.getWorkarea() catch |err| return {
+                std.log.err("Encountered '{}' while attempting to query primary monitor size; plese specify a size using `--size=[index]`.", .{err});
+            };
             var i = supported_window_sizes.len;
             while (true) {
                 if (i == 0) break;
@@ -717,8 +722,13 @@ pub fn main() !void {
                     break :window_start_size_index i;
                 }
             }
-            return error.UnsupportedScreenSize;
+            std.log.err("", .{});
+            return;
         };
+        if (window_start_size_index >= supported_window_sizes.len) {
+            std.log.err("Unsupported window size index. Must be in the range [0,{d}).", .{supported_window_sizes.len});
+            return;
+        }
 
         const desired_vulkan_layers: []const [:0]const u8 = desired_vulkan_layers: {
             var vk_layers_iter = std.mem.tokenize(u8, cmdline_options.@"vk-layers", ", ");
@@ -741,15 +751,15 @@ pub fn main() !void {
             allocator.free(name);
         } else allocator.free(desired_vulkan_layers);
 
-        break :user_configured_data UserConfiguredData{
+        break :cmdline_data UserConfiguredData{
             .window_start_size_index = window_start_size_index,
             .desired_vulkan_layers = desired_vulkan_layers,
-            .list_layers_and_exit = cmdline_options.@"vk-list-layers",
+            .list_instance_layers_and_exit = cmdline_options.@"vk-list-layers",
         };
     };
     defer {
-        for (user_configured_data.desired_vulkan_layers) |name| allocator.free(name);
-        allocator.free(user_configured_data.desired_vulkan_layers);
+        for (cmdline_data.desired_vulkan_layers) |name| allocator.free(name);
+        allocator.free(cmdline_data.desired_vulkan_layers);
     }
 
     const indices_data: []const u16 = &[_]u16{
@@ -764,7 +774,7 @@ pub fn main() !void {
     };
 
     const window: glfw.Window = window: {
-        const size = supported_window_sizes[user_configured_data.window_start_size_index];
+        const size = supported_window_sizes[cmdline_data.window_start_size_index];
         break :window try glfw.Window.create(size.width, size.height, "vulkan-spincube", null, null, glfw.Window.Hints{
             .client_api = .no_api,
             .resizable = false,
@@ -803,43 +813,38 @@ pub fn main() !void {
         .p_user_data = null,
     } else void{};
 
+    const base_dsp = try BaseDispatch.load(getInstanceProcAddress);
+
+    if (cmdline_data.list_instance_layers_and_exit) return {
+        var stdout = std.io.bufferedWriter(std.io.getStdOut().writer());
+
+        const available_layers: []const vk.LayerProperties = try vkutil.enumerateInstanceLayerPropertiesAlloc(allocator, base_dsp);
+        defer allocator.free(available_layers);
+
+        try stdout.writer().writeAll("Available Instance Layers:\n");
+        for (available_layers) |available| {
+            try stdout.writer().print("    * {s}\n", .{std.mem.sliceTo(&available.layer_name, 0)});
+        }
+
+        try stdout.flush();
+    };
+
     const inst: VulkanInstance = inst: {
-        const bdsp = try BaseDispatch.load(getInstanceProcAddress);
         const dsp_min = try InstanceDispatchMin.load(.null_handle, getInstanceProcAddress);
 
         var local_arena_state = std.heap.ArenaAllocator.init(allocator);
         defer local_arena_state.deinit();
-
         const local_arena = local_arena_state.allocator();
 
-        const StringZContext = struct {
-            pub fn hash(ctx: @This(), key: [:0]const u8) u32 {
-                _ = ctx;
-                return @truncate(u32, std.hash_map.hashString(key));
-            }
-            pub fn eql(ctx: @This(), a: [:0]const u8, b: [:0]const u8, b_index: usize) bool {
-                _ = ctx;
-                _ = b_index;
-                return std.hash_map.eqlString(a, b);
-            }
-        };
-
-        const available_layers: []const vk.LayerProperties = try vkutil.enumerateInstanceLayerPropertiesAlloc(local_arena, bdsp);
-        if (user_configured_data.list_layers_and_exit) return {
-            var stdout = std.io.bufferedWriter(std.io.getStdOut().writer());
-
-            try stdout.writer().writeAll("Available Instance Layers:\n");
-            for (available_layers) |available| {
-                try stdout.writer().print("    * {s}\n", .{std.mem.sliceTo(&available.layer_name, 0)});
-            }
-
-            try stdout.flush();
-        };
+        const StringZContext = util.ManyPtrContextArrayHashMap([:0]const u8);
+        const available_layers: []const vk.LayerProperties = try vkutil.enumerateInstanceLayerPropertiesAlloc(local_arena, base_dsp);
+        const available_extensions: []const vk.ExtensionProperties = try vkutil.enumerateInstanceExtensionPropertiesAlloc(local_arena, base_dsp, null);
 
         const desired_layers: []const [:0]const u8 = desired_layers: {
-            var desired_layers_set = std.ArrayHashMap([:0]const u8, usize, StringZContext, true).init(local_arena);
-            const closure: struct {
-                p_desired_layers: *std.ArrayHashMap([:0]const u8, usize, StringZContext, true),
+            const DesiredLayersSet = std.ArrayHashMap([:0]const u8, usize, StringZContext, true);
+            const Closure = struct {
+                p_desired_layers: *DesiredLayersSet,
+
                 fn addDesiredLayerName(closure: @This(), str: [:0]const u8) !void {
                     const gop = try closure.p_desired_layers.getOrPut(str);
                     if (gop.found_existing) {
@@ -849,12 +854,15 @@ pub fn main() !void {
                         gop.value_ptr.* = 1;
                     }
                 }
-            } = .{
+            };
+
+            var desired_layers_set = DesiredLayersSet.init(local_arena);
+            const closure: Closure = .{
                 .p_desired_layers = &desired_layers_set,
             };
 
-            try desired_layers_set.ensureUnusedCapacity(user_configured_data.desired_vulkan_layers.len);
-            for (user_configured_data.desired_vulkan_layers) |layer_name| {
+            try desired_layers_set.ensureUnusedCapacity(cmdline_data.desired_vulkan_layers.len);
+            for (cmdline_data.desired_vulkan_layers) |layer_name| {
                 try closure.addDesiredLayerName(layer_name);
             }
 
@@ -897,18 +905,32 @@ pub fn main() !void {
                 try desired_extensions.append(vk.extension_info.ext_debug_utils.name);
             }
 
-            {
-                const required_glfw_extensions = try glfw.getRequiredInstanceExtensions();
+            if (glfw.getRequiredInstanceExtensions()) |required_glfw_extensions| {
                 try desired_extensions.ensureUnusedCapacity(required_glfw_extensions.len);
                 for (required_glfw_extensions) |req_glfw_ext| {
                     desired_extensions.appendAssumeCapacity(req_glfw_ext);
                 }
+            } else |err| {
+                std.log.err("Failed to query required GLFW extensions: '{}'.", .{err});
+                return;
             }
 
             break :desired_extensions desired_extensions.toOwnedSlice();
         };
+        for (desired_extensions) |desired_ext| {
+            const desired_ext_name = std.mem.span(desired_ext);
+            for (available_extensions) |available_ext| {
+                const available_ext_name = std.mem.sliceTo(&available_ext.extension_name, 0);
+                if (std.mem.eql(u8, desired_ext_name, available_ext_name)) {
+                    break;
+                }
+            } else {
+                std.log.err("Desired extension '{s}' doesn't appear available.", .{std.mem.span(desired_ext)});
+                return;
+            }
+        }
 
-        const handle = try vkutil.createInstance(allocator, bdsp, vkutil.InstanceCreateInfo{
+        const handle = try vkutil.createInstance(allocator, base_dsp, vkutil.InstanceCreateInfo{
             .p_next = if (build_options.vk_debug) &debug_messenger_create_info else null,
             .enabled_layer_names = selected_layers,
             .enabled_extension_names = desired_extensions,
@@ -936,7 +958,10 @@ pub fn main() !void {
         defer allocator.free(all_physical_devices);
 
         const selected_index: usize = switch (all_physical_devices.len) {
-            0 => return error.NoAvailableVulkanPhysicalDevices,
+            0 => {
+                std.log.err("No vulkan physical devices available.", .{});
+                return;
+            },
             1 => 0,
             else => blk: {
                 std.log.warn("TODO: Implement algorithm for selecting between than >={d} physical devices; defaulting to physical device 0.", .{all_physical_devices.len});
@@ -1610,17 +1635,17 @@ pub fn main() !void {
                         .offset = uniform_buffer_segment_len * i,
                         .range = uniform_buffer_segment_len,
                     }},
-                    .p_image_info = emptySlice(vk.DescriptorImageInfo).ptr,
-                    .p_texel_buffer_view = emptySlice(vk.BufferView).ptr,
+                    .p_image_info = util.emptySlice(vk.DescriptorImageInfo).ptr,
+                    .p_texel_buffer_view = util.emptySlice(vk.BufferView).ptr,
                 }};
-                vkutil.updateDescriptorSets(device.dsp, device.handle, &descriptor_write, emptySlice(vk.CopyDescriptorSet));
+                vkutil.updateDescriptorSets(device.dsp, device.handle, &descriptor_write, util.emptySlice(vk.CopyDescriptorSet));
             }
         }
 
         break :init_ubo_buff_and_descriptor_sets;
     }
 
-    const texture_embed = @embedFile("../res/texture.jpg");
+    const texture_embed = resources.texture;
     const texture_info = try stb_img.infoFromMemory(texture_embed);
 
     const texture_extent = vk.Extent3D{
@@ -1645,7 +1670,7 @@ pub fn main() !void {
         .sharing_mode = .exclusive,
 
         .queue_family_index_count = 0,
-        .p_queue_family_indices = emptySlice(u32).ptr,
+        .p_queue_family_indices = util.emptySlice(u32).ptr,
 
         .initial_layout = .@"undefined",
     }, &vkutil.allocCallbacksFrom(&allocator));
@@ -1768,14 +1793,14 @@ pub fn main() !void {
 
         try device.dsp.queueSubmit(device.dsp.getDeviceQueue(device.handle, core_qfi.graphics, 0), 1, &[_]vk.SubmitInfo{.{
             .wait_semaphore_count = @intCast(u32, 0),
-            .p_wait_semaphores = emptySlice(vk.Semaphore).ptr,
-            .p_wait_dst_stage_mask = emptySlice(vk.PipelineStageFlags).ptr,
+            .p_wait_semaphores = util.emptySlice(vk.Semaphore).ptr,
+            .p_wait_dst_stage_mask = util.emptySlice(vk.PipelineStageFlags).ptr,
 
             .command_buffer_count = 1,
             .p_command_buffers = &[_]vk.CommandBuffer{copy_cmdbuffer},
 
             .signal_semaphore_count = @intCast(u32, 0),
-            .p_signal_semaphores = emptySlice(vk.Semaphore).ptr,
+            .p_signal_semaphores = util.emptySlice(vk.Semaphore).ptr,
         }}, .null_handle);
         try device.dsp.queueWaitIdle(device.dsp.getDeviceQueue(device.handle, core_qfi.graphics, 0));
 
@@ -1907,14 +1932,14 @@ pub fn main() !void {
 
         try device.dsp.queueSubmit(device.dsp.getDeviceQueue(device.handle, core_qfi.graphics, 0), 1, &[_]vk.SubmitInfo{.{
             .wait_semaphore_count = @intCast(u32, 0),
-            .p_wait_semaphores = emptySlice(vk.Semaphore).ptr,
-            .p_wait_dst_stage_mask = emptySlice(vk.PipelineStageFlags).ptr,
+            .p_wait_semaphores = util.emptySlice(vk.Semaphore).ptr,
+            .p_wait_dst_stage_mask = util.emptySlice(vk.PipelineStageFlags).ptr,
 
             .command_buffer_count = 1,
             .p_command_buffers = &[_]vk.CommandBuffer{copy_cmdbuffer},
 
             .signal_semaphore_count = @intCast(u32, 0),
-            .p_signal_semaphores = emptySlice(vk.Semaphore).ptr,
+            .p_signal_semaphores = util.emptySlice(vk.Semaphore).ptr,
         }}, .null_handle);
         try device.dsp.queueWaitIdle(device.dsp.getDeviceQueue(device.handle, core_qfi.graphics, 0));
 
@@ -2061,7 +2086,7 @@ pub fn main() !void {
                 device.dsp.cmdBindVertexBuffers(cmdbuffer, 0, 1, &[_]vk.Buffer{vertices_buffer}, &[_]vk.DeviceSize{0});
                 vkutil.cmdBindVertexBuffers(device.dsp, cmdbuffer, 0, &.{vertices_buffer}, &.{0});
                 device.dsp.cmdBindIndexBuffer(cmdbuffer, index_buffer, 0, vk.IndexType.uint16);
-                device.dsp.cmdBindDescriptorSets(cmdbuffer, .graphics, graphics_pipeline_layout, 0, 1, @ptrCast([*]const vk.DescriptorSet, &descriptor_set), 0, emptySlice(u32).ptr);
+                device.dsp.cmdBindDescriptorSets(cmdbuffer, .graphics, graphics_pipeline_layout, 0, 1, @ptrCast([*]const vk.DescriptorSet, &descriptor_set), 0, util.emptySlice(u32).ptr);
                 device.dsp.cmdDrawIndexed(cmdbuffer, @intCast(u32, indices_data.len), 1, 0, 0, 0);
 
                 device.dsp.cmdEndRenderPass(cmdbuffer);

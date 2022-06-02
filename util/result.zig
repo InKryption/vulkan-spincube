@@ -13,10 +13,19 @@ pub fn Result(
         err: Err,
 
         pub fn init(
-            comptime tag: ResultTag,
-            expr: std.meta.fields(Self)[std.meta.fieldIndex(Self, @tagName(tag)).?].field_type,
+            maybe_error_info: (if (@sizeOf(ErrPayload) == 0) @TypeOf(null) else ?ErrPayload),
+            error_union: ErrorUnion,
         ) Self {
-            return @unionInit(Self, @tagName(tag), expr);
+            if (error_union) |ok| {
+                std.debug.assert(maybe_error_info == null);
+                return Self{ .ok = ok };
+            } else |err_value| {
+                const info = if (@sizeOf(ErrPayload) == 0) undefined else maybe_error_info.?;
+                return Self{ .err = .{
+                    .value = err_value,
+                    .info = info,
+                } };
+            }
         }
 
         pub fn unwrap(self: Self) Err.Value!Ok {
