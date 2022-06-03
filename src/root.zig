@@ -530,7 +530,7 @@ const CreateExtensionSetConfig = struct {
     store_hash: bool = false,
 };
 
-fn allocateOneCommandBuffer(
+fn allocOneCommandBuffer(
     device_dsp: anytype,
     device: vk.Device,
     command_pool: vk.CommandPool,
@@ -841,7 +841,7 @@ pub fn main() !void {
         const available_extensions: []const vk.ExtensionProperties = try vkutil.enumerateInstanceExtensionPropertiesAlloc(local_arena, base_dsp, null);
 
         const desired_layers: []const [:0]const u8 = desired_layers: {
-            const DesiredLayersSet = std.ArrayHashMap([:0]const u8, usize, StringZContext, true);
+            const DesiredLayersSet = std.ArrayHashMap([:0]const u8, usize, StringZContext, false);
             const Closure = struct {
                 p_desired_layers: *DesiredLayersSet,
 
@@ -1687,6 +1687,27 @@ pub fn main() !void {
     };
     defer device.freeMemory(allocator, texture_memory);
 
+    const texture_image_view: vk.ImageView = try vkutil.createImageView(allocator, device.dsp, device.handle, vk.ImageViewCreateInfo{
+        .flags = vk.ImageViewCreateFlags{},
+        .image = texture_image,
+        .view_type = .@"2d",
+        .format = .r8g8b8a8_srgb,
+        .components = vk.ComponentMapping{
+            .r = .identity,
+            .g = .identity,
+            .b = .identity,
+            .a = .identity,
+        },
+        .subresource_range = vk.ImageSubresourceRange{
+            .aspect_mask = vk.ImageAspectFlags{ .color_bit = true },
+            .base_mip_level = 0,
+            .level_count = 1,
+            .base_array_layer = 0,
+            .layer_count = 1,
+        },
+    });
+    defer vkutil.destroyImageView(allocator, device.dsp, device.handle, texture_image_view);
+
     try device.dsp.bindImageMemory(device.handle, texture_image, texture_memory, 0);
 
     init_texture_memory: {
@@ -1732,7 +1753,7 @@ pub fn main() !void {
             break :init_staging_buff_data;
         }
 
-        const copy_cmdbuffer = try allocateOneCommandBuffer(device.dsp, device.handle, copying_cmdpool, .primary);
+        const copy_cmdbuffer = try allocOneCommandBuffer(device.dsp, device.handle, copying_cmdpool, .primary);
         defer device.dsp.freeCommandBuffers(device.handle, copying_cmdpool, 1, @ptrCast(*const [1]vk.CommandBuffer, &copy_cmdbuffer));
 
         record_copy_cmdbuffer: {
@@ -1906,7 +1927,7 @@ pub fn main() !void {
             break :init_staging_buffer;
         }
 
-        const copy_cmdbuffer = try allocateOneCommandBuffer(device.dsp, device.handle, copying_cmdpool, .primary);
+        const copy_cmdbuffer = try allocOneCommandBuffer(device.dsp, device.handle, copying_cmdpool, .primary);
         defer device.dsp.freeCommandBuffers(device.handle, copying_cmdpool, 1, @ptrCast(*const [1]vk.CommandBuffer, &copy_cmdbuffer));
 
         record_copy_cmdbuffer: {
