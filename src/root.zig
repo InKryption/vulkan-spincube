@@ -837,9 +837,8 @@ pub fn main() !void {
         const local_arena = local_arena_state.allocator();
 
         const StringZContext = util.ManyPtrContextArrayHashMap([:0]const u8);
-        const available_layers: []const vk.LayerProperties = try vkutil.enumerateInstanceLayerPropertiesAlloc(local_arena, base_dsp);
-        const available_extensions: []const vk.ExtensionProperties = try vkutil.enumerateInstanceExtensionPropertiesAlloc(local_arena, base_dsp, null);
 
+        const available_layers: []const vk.LayerProperties = try vkutil.enumerateInstanceLayerPropertiesAlloc(local_arena, base_dsp);
         const desired_layers: []const [:0]const u8 = desired_layers: {
             const DesiredLayersSet = std.ArrayHashMap([:0]const u8, usize, StringZContext, false);
             const Closure = struct {
@@ -897,6 +896,7 @@ pub fn main() !void {
             break :selected_layers selected_layers;
         };
 
+        const available_extensions: []const vk.ExtensionProperties = try vkutil.enumerateInstanceExtensionPropertiesAlloc(local_arena, base_dsp, null);
         const desired_extensions: []const [*:0]const u8 = desired_extensions: {
             var desired_extensions = std.ArrayList([*:0]const u8).init(local_arena);
             errdefer desired_extensions.deinit();
