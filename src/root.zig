@@ -917,6 +917,9 @@ pub fn main() !void {
 
             break :desired_extensions desired_extensions.toOwnedSlice();
         };
+        if (desired_extensions.len > available_extensions.len) {
+            std.log.warn("Requesting {d} instance extensions, but only {d} instance extensions available.", .{ desired_extensions.len, available_extensions.len });
+        }
         for (desired_extensions) |desired_ext| {
             const desired_ext_name = std.mem.span(desired_ext);
             for (available_extensions) |available_ext| {
