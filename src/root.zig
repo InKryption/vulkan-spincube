@@ -973,6 +973,12 @@ pub fn main() !void {
         };
         const physical_device: vk.PhysicalDevice = all_physical_devices[selected_index];
 
+        const features = inst.dsp.getPhysicalDeviceFeatures(physical_device);
+        if (features.sampler_anisotropy != vk.TRUE) {
+            std.log.err("Couldn't select device with sampler_anisotropy feature.", .{});
+            return;
+        }
+
         const properties = inst.dsp.getPhysicalDeviceProperties(physical_device);
         std.log.info(
             \\Selected physical device at index {d}:
